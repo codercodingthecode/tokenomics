@@ -1,0 +1,17 @@
+[Unit]
+Description=tokenomics vLLM token/cost dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tokenomics
+ExecStart=/usr/bin/python3 /opt/tokenomics/server.py --port 8787
+Environment=TOKENOMICS_QUIET=1
+Restart=always
+RestartSec=5
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target

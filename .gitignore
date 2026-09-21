@@ -1,0 +1,10 @@
+.DS_Store
+config.json
+state.json
+state.json.tmp
+state/
+history.sqlite
+history.sqlite-wal
+history.sqlite-shm
+__pycache__/
+*.pyc

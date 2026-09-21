@@ -1,0 +1,49 @@
+{
+  "source": {
+    "label": "my inference box",
+    "metrics_url": "http://127.0.0.1:8000/metrics",
+    "bearer_token": "REPLACE_WITH_YOUR_METRICS_BEARER_TOKEN"
+  },
+  "poll_interval_seconds": 5,
+  "history_minutes": 60,
+  "history_ttl_days": 7,
+  "smoothing_seconds": 120,
+  "state_file": "state.json",
+  "hero_provider": "Frontier API",
+  "pod": {
+    "name": "my box",
+    "hourly_usd": 0.62,
+    "started_at": "2026-01-01T00:00:00Z",
+    "paused_hours": 0,
+    "prior_usd": 0,
+    "prior_hours": 0
+  },
+  "providers": [
+    {
+      "name": "Frontier API",
+      "input_per_m": 10.0,
+      "cached_input_per_m": 1.0,
+      "output_per_m": 50.0
+    },
+    {
+      "name": "Mid-tier API",
+      "input_per_m": 3.0,
+      "cached_input_per_m": 0.3,
+      "output_per_m": 15.0
+    },
+    {
+      "name": "Open-weights host",
+      "input_per_m": 0.575,
+      "cached_input_per_m": 0.115,
+      "output_per_m": 3.45
+    }
+  ],
+  "gpu": {
+    "sysfs": "/sys/class/drm",
+    "label": "local GPUs"
+  },
+  "cpu": {
+    "hwmon": "/sys/class/hwmon",
+    "sysfs": "/sys/devices/system/cpu"
+  }
+}
