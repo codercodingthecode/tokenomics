@@ -2,26 +2,28 @@
   "use strict";
   const $ = id => document.getElementById(id);
 
-  // ---------- theme: URL param wins, then the saved toggle, else dark (the markup default) ----------
+  // ---------- theme: URL param wins, then the saved choice, else dark (the markup default) ----------
+  const THEMES = ["dark", "amber", "light"];
+  const THEME_META = { dark: "#07090c", amber: "#120d07", light: "#f3f5f8" };
+  const isTheme = t => THEMES.indexOf(t) >= 0;
   function applyTheme(t) {
+    if (!isTheme(t)) t = "dark";
     document.documentElement.setAttribute("data-theme", t);
     const m = $("themeMeta");
-    if (m) m.setAttribute("content", t === "dark" ? "#07090c" : "#f3f5f8");
+    if (m) m.setAttribute("content", THEME_META[t]);
+    const btn = $("themeBtn");
+    if (btn) btn.title = "theme: " + t + " \u00b7 click for " + THEMES[(THEMES.indexOf(t) + 1) % THEMES.length];
   }
-  const themeParam = new URLSearchParams(location.search).get("theme");
-  if (themeParam === "light" || themeParam === "dark") {
-    applyTheme(themeParam);
-  } else {
-    let saved = null;
-    try { saved = localStorage.getItem("tokenomics.theme"); } catch (e) {}
-    if (saved === "light" || saved === "dark") applyTheme(saved);
-  }
+  let themeStart = new URLSearchParams(location.search).get("theme");
+  if (!isTheme(themeStart)) { try { themeStart = localStorage.getItem("tokenomics.theme"); } catch (e) {} }
+  applyTheme(themeStart);
   $("themeBtn").addEventListener("click", () => {
-    const next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+    const cur = document.documentElement.getAttribute("data-theme");
+    const next = THEMES[(Math.max(0, THEMES.indexOf(cur)) + 1) % THEMES.length];
     applyTheme(next);
     try { localStorage.setItem("tokenomics.theme", next); } catch (e) {}
+    // series colors are CSS custom properties, so the panes repaint themselves
   });
-
   let lastSnap = null;
   let scopeMode = "total";
   let rangeMin = 15;          // chart window in minutes; the live snapshot carries history_minutes of it
@@ -156,6 +158,7 @@
     $("since").textContent = fmtDate(s.since);
     if (s.source) { $("srcLabel").textContent = s.source.label || ""; $("model").textContent = s.source.model || ""; }
     renderGPUs(s);
+    renderCPU(s);
     if (!s.live) return;
     const L = s.live, sc = scopeData(s), T = sc.totals, P = sc.pod;
 
@@ -212,8 +215,7 @@
       $("dbInfo").textContent = "chart samples: " + db.rows.toLocaleString("en-US") + " in SQLite" + (mb ? " (" + mb + ")" : "") +
         ", " + db.ttl_days + "-day TTL \u00b7 totals & costs: all-time, never pruned \u00b7 daily ledger: " + (db.ledger_days || 0) + " days";
     }
-    if (rangeMin === (s.history_minutes || 60)) drawChart(s.history || []);
-    else if (rangeData) drawChart(rangeData);
+    drawAll();
   }
 
   function renderBars(sc) {
@@ -256,102 +258,204 @@
       `<div class="chip"${it.full ? ` title="${it.full}"` : ""}><div class="chip-label">${it.l}</div><div class="chip-value">${it.v}</div><div class="chip-sub">${it.sub}</div></div>`).join("");
   }
 
-  // ---------- chart: gradient area, per-poll line + trailing average, crosshair tooltip ----------
-  const svg = $("svg"), tip = $("tip"), chartEl = $("chart");
-  let pts = [], idleEl = null;
+  // ---------- charts: one engine (static/charts.js), one instance per pane ----------
+  const TC = window.TokCharts;
+  const v0 = v => v == null ? "\u2013" : String(Math.round(v));
+  const v1 = v => v == null ? "\u2013" : v.toFixed(1);
+  const v2 = v => v == null ? "\u2013" : v.toFixed(2);
+  const fmtPct = v => v == null ? "\u2013" : v0(v) + "%";
+  const fmtDeg = v => v == null ? "\u2013" : v1(v) + "\u00b0C";
+  const fmtGhz = v => v == null ? "\u2013" : v2(v) + " GHz";
+
+  function tipHead(row) {
+    const when = rangeMin >= 360
+      ? new Date(row.t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+      : tFull(row.t * 1000);
+    return `<div class="tip-t">${when}</div>`;
+  }
+  // rows are [label, value, class]; a null value drops the row so tooltips never read "–"
+  function tipBody(rows) {
+    return rows.filter(r => r && r[1] != null && r[1] !== "")
+      .map(r => `<div class="tip-r"><span>${r[0]}</span><b class="${r[2] || ""}">${r[1]}</b></div>`).join("");
+  }
+  function stats(rows, key) {
+    const vs = rows.map(r => r[key]).filter(v => v != null && isFinite(v));
+    if (!vs.length) return null;
+    const sum = vs.reduce((a, b) => a + b, 0);
+    return { n: vs.length, avg: sum / vs.length, lo: Math.min.apply(null, vs), hi: Math.max.apply(null, vs) };
+  }
+  function lastValue(rows, key) {
+    for (let i = rows.length - 1; i >= 0; i--) { const v = rows[i][key]; if (v != null && isFinite(v)) return v; }
+    return null;
+  }
+
+  // the idle badge belongs to the throughput pane only: 0 tok/s is a state, missing data is not
+  let idleEl = null;
   function setIdle(on) {
     if (on) {
       if (!idleEl) {
         idleEl = document.createElement("div");
         idleEl.className = "chart-idle";
         idleEl.innerHTML = "<span>idle \u2014 no generation</span>";
-        chartEl.appendChild(idleEl);
+        $("chart").appendChild(idleEl);
       }
     } else if (idleEl) { idleEl.remove(); idleEl = null; }
   }
-  function drawChart(hist) {
-    const W = 1000, H = 240, padL = 46, padR = 60, padT = 16, padB = 28;
-    const data = hist.filter(h => h && typeof h.gen_tps === "number");
-    if (data.length < 2) { svg.innerHTML = ""; setIdle(false); pts = []; return; }
-    const t0 = data[0].t, t1 = data[data.length - 1].t || t0 + 1;
-    const vmax = Math.max(10, ...data.map(d => Math.max(d.gen_tps || 0, d.gen_tps_avg || 0)));
-    const ymax = Math.ceil(vmax / 10) * 10;
-    const x = t => padL + (W - padL - padR) * (t - t0) / Math.max(t1 - t0, 1);
-    const y = v => padT + (H - padT - padB) * (1 - v / ymax);
-    pts = data.map(d => ({ cx: x(d.t), cy: y(d.gen_tps || 0), cyAvg: y(d.gen_tps_avg || 0), d }));
-    const grid = [0, 0.25, 0.5, 0.75, 1].map(f => {
-      const v = ymax * f;
-      return `<line x1="${padL}" x2="${W - padR}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}" stroke="var(--grid)" stroke-width="1"${f === 0 ? "" : ' stroke-dasharray="2 6"'} vector-effect="non-scaling-stroke"/>` +
-        `<text x="${padL - 9}" y="${(y(v) + 3.5).toFixed(1)}" text-anchor="end" font-size="10.5" fill="var(--text-3)">${Math.round(v)}</text>`;
-    }).join("");
-    const path = pts.map((p, i) => (i ? "L" : "M") + p.cx.toFixed(1) + " " + p.cy.toFixed(1)).join(" ");
-    const pathAvg = pts.map((p, i) => (i ? "L" : "M") + p.cx.toFixed(1) + " " + p.cyAvg.toFixed(1)).join(" ");
-    const area = path + ` L${pts[pts.length - 1].cx.toFixed(1)} ${y(0).toFixed(1)} L${pts[0].cx.toFixed(1)} ${y(0).toFixed(1)} Z`;
-    const span = Math.max(t1 - t0, 1);
-    const tfmt = t => {
-      const dt = new Date(t * 1000); // history t is epoch seconds
-      if (span >= 2 * 86400) return dt.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
-      if (span >= 6 * 3600) return dt.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-      return span >= 900
-        ? dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-        : dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    };
-    const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => {
-      const t = t0 + span * f;
-      const anchor = f === 0 ? "start" : f === 1 ? "end" : "middle";
-      return `<text x="${x(t).toFixed(1)}" y="${H - 6}" text-anchor="${anchor}" font-size="10.5" fill="var(--text-3)">${tfmt(t)}</text>`;
-    }).join("");
-    const last = pts[pts.length - 1];
-    const idle = Math.max(0, ...data.map(d => d.gen_tps || 0)) === 0;
-    setIdle(idle);
-    // var() is unreliable in SVG presentation attributes, so gradient stops carry it via style=""
-    const defs = `<defs><linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">` +
-      `<stop offset="0" style="stop-color:var(--line);stop-opacity:.20"/>` +
-      `<stop offset=".65" style="stop-color:var(--line);stop-opacity:.05"/>` +
-      `<stop offset="1" style="stop-color:var(--line);stop-opacity:0"/>` +
-      `</linearGradient></defs>`;
-    const nowLabel = `<text x="${W - padR + 10}" y="${(last.cy + 4).toFixed(1)}" font-size="12" font-weight="650" fill="var(--text)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">${(last.d.gen_tps || 0).toFixed(1)}</text>`;
-    svg.innerHTML = defs + grid +
-      `<path d="${area}" fill="url(#areaGrad)"/>` +
-      `<path d="${pathAvg}" fill="none" stroke="var(--text-3)" stroke-width="1.25" stroke-dasharray="4 5" opacity=".85" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>` +
-      `<path d="${path}" fill="none" stroke="var(--line)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"/>` +
-      `<line id="xh" x1="0" x2="0" y1="${padT}" y2="${H - padB}" stroke="var(--border-3)" stroke-width="1" stroke-dasharray="3 4" vector-effect="non-scaling-stroke" style="display:none"/>` +
-      `<circle cx="${last.cx.toFixed(1)}" cy="${last.cy.toFixed(1)}" r="6" fill="var(--line)" opacity=".16"/>` +
-      `<circle cx="${last.cx.toFixed(1)}" cy="${last.cy.toFixed(1)}" r="3" fill="var(--line)"/>` +
-      `<circle id="dot" r="4.5" fill="var(--line)" stroke="var(--surface)" stroke-width="2" style="display:none"/>` +
-      nowLabel + ticks;
-  }
-  chartEl.addEventListener("mousemove", e => {
-    if (!pts.length) return;
-    const r = svg.getBoundingClientRect();
-    const mx = (e.clientX - r.left) / r.width * 1000;
-    let best = pts[0];
-    for (const p of pts) if (Math.abs(p.cx - mx) < Math.abs(best.cx - mx)) best = p;
-    const xh = $("xh"), dot = $("dot");
-    if (!xh || !dot) return;
-    xh.setAttribute("x1", best.cx); xh.setAttribute("x2", best.cx); xh.style.display = "";
-    dot.setAttribute("cx", best.cx); dot.setAttribute("cy", best.cy); dot.style.display = "";
-    const d = best.d;
-    const tipTime = rangeMin >= 360
-      ? new Date(d.t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-      : tFull(d.t * 1000);
-    tip.innerHTML = `<div class="tip-t">${tipTime}</div>` +
-      `<div class="tip-r"><span>throughput</span><b class="v-big">${(d.gen_tps || 0).toFixed(1)}</b></div>` +
-      `<div class="tip-r"><span>avg</span><b>${(d.gen_tps_avg || 0).toFixed(1)}</b></div>` +
-      `<div class="tip-r"><span>running</span><b>${d.running || 0}</b></div>` +
-      `<div class="tip-r"><span>kv cache</span><b>${d.kv == null ? "\u2013" : d.kv.toFixed(0) + "%"}</b></div>`;
-    tip.style.display = "block";
-    const px = best.cx / 1000 * r.width;
-    tip.style.left = Math.min(px + 14, Math.max(r.width - tip.offsetWidth - 2, 0)) + "px";
-    tip.style.top = "6px";
-  });
-  chartEl.addEventListener("mouseleave", () => {
-    tip.style.display = "none";
-    const xh = $("xh"), dot = $("dot");
-    if (xh) xh.style.display = "none";
-    if (dot) dot.style.display = "none";
+
+  const chartThroughput = TC.makeChart({
+    svg: $("svg"), wrap: $("chart"), tip: $("tip"),
+    label: "Generation throughput in tokens per second",
+    series: [
+      { get: d => d.gen_tps, color: "line", width: 2, area: .22 },
+      { get: d => d.gen_tps_avg, color: "text-3", width: 1.25, dash: "5 5", noDot: true, noPill: true },
+    ],
+    tipRows: row => tipHead(row) + tipBody([
+      ["throughput", v1(row.gen_tps), "v-big"],
+      ["window avg", v1(row.gen_tps_avg)],
+      ["running", row.running == null ? null : v0(row.running)],
+      ["kv cache", row.kv == null ? null : fmtPct(row.kv)],
+    ]),
+    emptyHtml: "no samples yet",
   });
 
+  // thresholds come from the sensor's own crit point, never hard-coded per chip
+  const chartTemp = TC.makeChart({
+    svg: $("svgCpuT"), wrap: $("cpuTChart"), tip: $("tipCpuT"),
+    label: "CPU package temperature in degrees Celsius",
+    unit: "\u00b0C", yTicks: 4, zeroBase: false, padFrac: .26,
+    series: [{ get: d => d.cpu_c, color: "t-ok", width: 2, area: .2 }],
+    bands: [], refs: [],
+    tipRows: row => tipHead(row) + tipBody([
+      ["package", fmtDeg(row.cpu_c), "v-temp"],
+      ["fastest core", fmtGhz(row.cpu_ghz)],
+      ["busy", fmtPct(row.cpu_pct)],
+      ["load 1m", row.load1 == null ? null : v1(row.load1)],
+      ["gpu edge", fmtDeg(row.gpu_c)],
+    ]),
+    emptyHtml: "no cpu temperature sensor",
+  });
+
+  const chartClock = TC.makeChart({
+    svg: $("svgCpuS"), wrap: $("cpuSChart"), tip: $("tipCpuS"),
+    label: "CPU clock speed in gigahertz",
+    unit: "", yTicks: 4, zeroBase: false, padFrac: .2,
+    series: [{ get: d => d.cpu_ghz, color: "power", width: 2, area: .2, fmt: fmtGhz }],
+    refs: [],
+    tipRows: row => tipHead(row) + tipBody([
+      ["fastest core", fmtGhz(row.cpu_ghz), "v-clock"],
+      ["busy", fmtPct(row.cpu_pct)],
+      ["package", fmtDeg(row.cpu_c)],
+    ]),
+    emptyHtml: "no cpufreq tables",
+  });
+
+  const chartLoad = TC.makeChart({
+    svg: $("svgCpuL"), wrap: $("cpuLChart"), tip: $("tipCpuL"),
+    label: "CPU utilisation percent",
+    unit: "%", yLo: 0, yHi: 100, yTicks: 5,
+    series: [{ get: d => d.cpu_pct, color: "series-pod", width: 2, area: .2, fmt: v => v == null ? "\u2013" : v0(v) }],
+    refs: [],
+    tipRows: row => tipHead(row) + tipBody([
+      ["busy", fmtPct(row.cpu_pct), "v-load"],
+      ["load 1m", row.load1 == null ? null : v1(row.load1)],
+      ["fastest core", fmtGhz(row.cpu_ghz)],
+    ]),
+    emptyHtml: "no /proc/stat access",
+  });
+
+  // one x domain across the four panes: sweeping one sweeps all, so a spike lines up everywhere
+  function linkCharts(list) {
+    list.forEach(c => {
+      const el = c.el();
+      if (!el) return;
+      el.addEventListener("mousemove", ev => {
+        const i = c.hitIndex(ev.clientX);
+        if (i < 0) return;
+        list.forEach(o => o.showAt(i, o === c, ev));
+      });
+      el.addEventListener("mouseleave", () => list.forEach(o => o.hide()));
+    });
+  }
+
+  // the live window rides on the snapshot; anything longer was fetched into rangeData
+  function currentRows() {
+    if (lastSnap && rangeMin === ((lastSnap.history_minutes) || 60)) return lastSnap.history || [];
+    return rangeData || [];
+  }
+
+  function foot(id, st, fmt, extra) {
+    const el = $(id);
+    if (!el) return;
+    if (!st) { el.innerHTML = "<span>no samples in this window</span>"; return; }
+    el.innerHTML = "min <b>" + fmt(st.lo) + "</b> \u00b7 avg <b>" + fmt(st.avg) + "</b> \u00b7 max <b>" + fmt(st.hi) +
+      "</b>" + (extra ? '<span class="sys-foot-x">' + extra + "</span>" : "");
+  }
+
+  function drawAll() {
+    const rows = currentRows();
+    const cpu = (lastSnap && lastSnap.cpu) || {};
+    const crit = cpu.crit_c || 95;
+
+    // temp: the line takes the heat colour of the newest sample, thresholds tint the plot
+    const tempNow = lastValue(rows, "cpu_c");
+    chartTemp.cfg.series[0].color = tempClass(tempNow == null ? cpu.tctl_c : tempNow);
+    chartTemp.cfg.bands = [
+      { from: 70, to: crit - 10, color: "t-warm-bg" },
+      { from: crit - 10, to: crit, color: "t-hot-bg" },
+      { from: crit, to: crit + 20, color: "t-crit-bg" },
+    ];
+    const ts = stats(rows, "cpu_c");
+    chartTemp.cfg.refs = ts ? [{ v: ts.avg, color: "text-3", label: "window avg" }] : [];
+    chartTemp.draw(rows);
+    foot("cpuFootT", ts, fmtDeg, ts ? "crit <b>" + v0(crit) + "\u00b0C</b>" : "");
+
+    const cs = stats(rows, "cpu_ghz");
+    chartClock.cfg.refs = cpu.ghz_boost_c
+      ? [{ v: cpu.ghz_boost_c, color: "power", label: "boost ceiling" }] : [];
+    chartClock.draw(rows);
+    foot("cpuFootS", cs, fmtGhz, cpu.boost == null ? ""
+      : (cpu.boost ? "boost <b>on</b>" : "boost <b>off</b>"));
+
+    const ls = stats(rows, "cpu_pct");
+    chartLoad.cfg.refs = ls ? [{ v: ls.avg, color: "text-3", label: "window avg" }] : [];
+    chartLoad.draw(rows);
+    foot("cpuFootL", ls, fmtPct, cpu.threads ? "load1 <b>" + v1(cpu.load1) + "</b> / " + cpu.threads + "t" : "");
+
+    let peak = 0;
+    for (const r of rows) peak = Math.max(peak, r.gen_tps || 0);
+    setIdle(rows.length > 1 && peak === 0);
+    chartThroughput.draw(rows);
+  }
+
+  function renderCPU(s) {
+    const cpu = s.cpu || {};
+    const card = $("sysCard");
+    if (!card) return;
+    const hasAny = cpu.tctl_c != null || cpu.ghz_max != null || cpu.pct != null;
+    card.classList.toggle("card-hidden", !hasAny);
+    if (!hasAny) return;
+    const now = (id, val, fmt, cls) => {
+      const el = $(id);
+      if (!el) return;
+      el.className = "sys-now " + (cls || "");
+      el.innerHTML = val == null ? "\u2013" : fmt(val) + "<small>" + (fmt === fmtDeg ? "\u00b0C" : fmt === fmtGhz ? "GHz" : "%") + "</small>";
+    };
+    now("cpuNowT", cpu.tctl_c, fmtDeg, tempClass(cpu.tctl_c));
+    now("cpuNowS", cpu.ghz_max, fmtGhz, "is-clock");
+    now("cpuNowL", cpu.pct, fmtPct, cpu.pct > 90 ? "t-hot" : "");
+    const bits = [];
+    if (cpu.model) bits.push(cpu.model);
+    if (cpu.cores) bits.push(cpu.cores + "C/" + (cpu.threads || cpu.cores) + "T");
+    if (cpu.load1 != null) bits.push("load " + v1(cpu.load1));
+    if (cpu.mem_pct != null) bits.push("mem " + v0(cpu.mem_pct) + "%");
+    if (cpu.boost != null) bits.push("boost " + (cpu.boost ? "on" : "off"));
+    $("cpuSub").textContent = bits.join(" \u00b7 ") || "host sensors";
+    $("cpuHint").innerHTML = "Package temp is <code>k10temp</code>/<code>coretemp</code> Tctl " +
+      "(the hottest sensor on the die, not the average), clocks are <code>scaling_cur_freq</code> across all threads "
+      "(the fastest core, which is where boost actually lands), utilisation is the delta of <code>/proc/stat</code>. " +
+      "All of it is read off the host that runs the server, so a container needs its <code>/sys</code> bind mounts \u2014 " +
+      "a gap in a line means the sensor was absent then, not that the host was idle.";
+  }
   // ---------- scope toggle ----------
   const scopeBtns = Array.prototype.slice.call(document.querySelectorAll("#scope button"));
   scopeBtns.forEach(b => b.addEventListener("click", () => {
@@ -360,26 +464,49 @@
     if (lastSnap) render(lastSnap);
   }));
 
-  // ---------- chart range: the live window comes with the snapshot; longer ranges are fetched from SQLite ----------
-  const rangeBtns = Array.prototype.slice.call(document.querySelectorAll("#range button"));
+  // ---------- chart range: the live window rides on the snapshot; longer ranges come from SQLite ----------
+  const rangeBtns = Array.prototype.slice.call(document.querySelectorAll(".range button"));
   const rangeNames = { 15: "last 15 minutes", 60: "last hour", 360: "last 6 hours", 1440: "last 24 hours", 10080: "last 7 days" };
   function fetchRange() {
     if (rangeMin === ((lastSnap && lastSnap.history_minutes) || 60)) return;
     fetch("/api/history?minutes=" + rangeMin).then(r => r.json()).then(j => {
       rangeData = j.points || [];
-      drawChart(rangeData);
+      drawAll();
     }).catch(() => {});
   }
-  rangeBtns.forEach(b => b.addEventListener("click", () => {
-    rangeMin = Number(b.dataset.min);
-    rangeBtns.forEach(x => { x.classList.toggle("on", x === b); x.setAttribute("aria-pressed", x === b ? "true" : "false"); });
-    $("rangeLabel").textContent = rangeNames[rangeMin] || ("last " + rangeMin + " min");
+  // both the throughput card and the CPU card carry a range picker: they are one control, twice painted
+  function setRange(min) {
+    rangeMin = Number(min);
+    rangeBtns.forEach(x => {
+      const on = Number(x.dataset.min) === rangeMin;
+      x.classList.toggle("on", on);
+      x.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    const label = rangeNames[rangeMin] || ("last " + rangeMin + " min");
+    $("rangeLabel").textContent = label;
+    const l2 = $("sysRangeLabel");
+    if (l2) l2.textContent = label;
     rangeData = null;
-    if (lastSnap && rangeMin === (lastSnap.history_minutes || 60)) drawChart(lastSnap.history || []);
+    if (lastSnap && rangeMin === (lastSnap.history_minutes || 60)) drawAll();
     else fetchRange();
-  }));
+  }
+  rangeBtns.forEach(b => b.addEventListener("click", () => setRange(b.dataset.min)));
   setInterval(fetchRange, 30000);
-  fetchRange(); // paint the non-default default range right away (snapshot only carries history_minutes)
+  fetchRange(); // paint the non-default default range right away (the snapshot only carries history_minutes)
+
+  linkCharts([chartThroughput, chartTemp, chartClock, chartLoad]);
+  // the viewBox is measured in CSS pixels, so a resize has to redraw the axes rather than stretch them
+  let resizeTimer = null;
+  function onResize() {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(drawAll, 140);
+  }
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(onResize);
+    ["chart", "cpuTChart", "cpuSChart", "cpuLChart"].forEach(id => { const el = $(id); if (el) ro.observe(el); });
+  } else {
+    window.addEventListener("resize", onResize);
+  }
 
   // ---------- live feed: SSE with polling fallback ----------
   setInterval(() => { if (lastSnap && lastSnap.updated_at) $("updated").textContent = ago(lastSnap.updated_at); }, 1000);

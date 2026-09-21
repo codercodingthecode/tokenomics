@@ -12,10 +12,12 @@ glance:
 3. **What is it costing, and what would the same traffic cost from an API?** your pod's
    wall-clock spend next to a per-provider price sheet, per scope, with the saving.
 
-Plus per-GPU temperature/power/fan (and CPU load) straight from host `hwmon`, with sparklines.
+Plus per-GPU temperature/power/fan straight from host `hwmon`, and a host CPU panel -
+package temperature, clock speed and utilisation as real charts - so a slow decode can be
+told apart from a hot or throttled machine.
 
 No build step, no framework, no CDN, no database server, no Python dependencies: one
-stdlib-only `server.py`, three static files, and a JSON config.
+stdlib-only `server.py`, four static files, and a JSON config.
 
 ## Quickstart
 
@@ -114,8 +116,10 @@ Every snapshot carries both, so switching in the UI needs no refetch:
 | `POST /api/vllm` | `{"action": "start" \| "stop" \| "restart"}` - only when `TOKENOMICS_VLLM_CONTROL=1` |
 | `GET /healthz` | `200 {"ok": true}` when the last poll succeeded, `503` with the error otherwise |
 
-Theme: dark by default, with a header toggle persisted in `localStorage`;
-`?theme=light` / `?theme=dark` in the URL wins over the saved choice.
+Theme: `dark` (default), `light`, and `amber` - a low-blue wall-display theme. The
+header button cycles all three and the choice persists in `localStorage`;
+`?theme=dark` / `?theme=light` / `?theme=amber` in the URL wins over the saved choice.
+Series colors are identical in all three, so only the chrome changes.
 
 ## How it works
 
@@ -141,6 +145,12 @@ browser <--(SSE /events)--
   (`/sys/class/drm/card*/device/hwmon/hwmon*`): edge/junction/memory temps, power draw
   and cap, fan RPM, clock. Absent path (running off-box) simply means no GPU tiles - no
   vendor CLI needed.
+- **Host CPU health** comes from `k10temp`/`zenpower` temp inputs under
+  `cpu.hwmon` (`/sys/class/hwmon`, `Tctl` = the hottest sensor on the die), per-thread
+  `scaling_cur_freq` plus `scaling_max_freq`/`boost` under `cpu.sysfs`
+  (`/sys/devices/system/cpu`), and `/proc/stat` deltas for utilisation. Every reader
+  returns `None` per field, the panel hides itself when all of them are absent, and a gap
+  in a chart line means the sensor was missing then, not that the host was idle.
 - **Stale-UI protection**: `ui_version` (max mtime of the static files) rides in every
   snapshot and the page reloads itself when it changes.
 
@@ -158,7 +168,9 @@ docker run -d --name tokenomics --restart unless-stopped -p 8787:8787 \
 ```
 
 The `state` mount keeps `state.json` and `history.sqlite` across image rebuilds; the
-`/sys/class/drm` mount is what enables the GPU tiles.
+`/sys/class/drm` mount is what enables the GPU tiles. The host CPU panel needs no extra
+mount - Docker's shared `sysfs` and `/proc/stat` already expose the CPU sensors and the
+host-wide utilisation counters.
 
 ### systemd
 

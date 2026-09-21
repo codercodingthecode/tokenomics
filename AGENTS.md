@@ -9,8 +9,9 @@ about how the code is put together, the constraints that are non-negotiable, and
 1. **Standard library only.** `server.py` imports nothing outside the Python 3.9 stdlib.
    No pip installs, no venv, no requirements.txt. That is the whole point: it has to run
    on a machine with no package index.
-2. **No frontend build.** `static/index.html` + `static/styles.css` + `static/app.js`,
-   vanilla JS, hand-drawn SVG chart. No framework, no bundler, no CDN, no webfonts.
+2. **No frontend build.** `static/index.html` + `static/styles.css` + `static/app.js` +
+   `static/charts.js`, vanilla JS, hand-drawn SVG (one small shared chart engine, no
+   charting library). No framework, no bundler, no CDN, no webfonts.
 3. **Single file server.** Everything server-side stays in `server.py`. If it grows past
    a point where modules are unavoidable, propose that first.
 4. **Nothing personal, nothing private, nothing vendor-specific in this repo.** No
@@ -28,7 +29,8 @@ about how the code is put together, the constraints that are non-negotiable, and
 | `server.py` | config, restart-safe state, poller thread, costs, hwmon readers, HTTP handler, SSE |
 | `static/index.html` | markup |
 | `static/styles.css` | all styling; theming through CSS custom properties |
-| `static/app.js` | SSE client, render loop, scope toggle, chart, theme toggle |
+| `static/charts.js` | `window.TokCharts` - the dependency-free SVG chart engine (line/area, monotone interpolation, gaps, bands, refs, end-value pills, crosshair) |
+| `static/app.js` | SSE client, render loop, scope toggle, chart instances, theme toggle |
 | `config.example.json` | documented template; copy to `config.json` |
 | `Dockerfile`, `tokenomics.service` | the two supported deploys |
 
@@ -106,16 +108,26 @@ CLIs, no `rocm-smi`/`nvidia-smi` shelling out.
 - Economics first: the hero is the saving against `hero_provider`; raw counters are
   secondary chips.
 - Two series colors only - blue for API providers, orange for the pod, validated for
-  colorblind separation in both themes. Green means savings/positive. Add rows rather
-  than new hues.
+  colorblind separation in every theme. Green means savings/positive. Add rows rather
+  than new hues. Host sensors use their own fixed semantic ramp
+  (`--t-ok`/`--t-warm`/`--t-hot`/`--t-crit` for temperature, `--power` for clocks,
+  `--series-pod` for load); a temp line takes the color of its newest sample.
 - Numbers in `ui-monospace` with `tabular-nums`, compact form primary (46.0M) with exact
   values in tooltips. Text never wears a series color.
 - Both scopes ride in every snapshot, so the Total/Session toggle is a pure client
   switch.
-- Chart: per-poll line plus dashed trailing average, "now" label at the line end,
-  adaptive x ticks (seconds under a 15 min span), crosshair tooltip, idle state, and
-  1h/6h/24h/7d ranges served from SQLite.
-- Dark is the default; the header toggle persists to `localStorage` and `?theme=` wins.
+- Charts go through `TokCharts.makeChart(cfg)` rather than new SVG strings per chart.
+  `null` is a break in the line, never a straight join; `bands` stay out of the y-domain
+  and `refs` stay in it; `zeroBase` defaults to true and is off for temperature. The
+  throughput chart and the three CPU panes share an x domain, so `linkCharts()` sweeps
+  one crosshair across all four. Colors are emitted as `var(--token)` - pass a CSS
+  variable name, never a raw color, and add new files to `STATIC_FILES` in `server.py`
+  or they will not be served.
+- Ranges come from SQLite: 15 min/1 h read the snapshot buffer, 6 h/24 h/7 d refetch,
+  and both copies of the range control stay in sync.
+- Themes: `dark` is the default, then `light`, then `amber`; the header button cycles and
+  persists to `localStorage`, and `?theme=` wins. Only chrome changes between themes -
+  data series keep the same hues, so a screenshot means the same thing.
 - `.flashy` / `.flash` give a one-shot background flash so live movement is visible.
 - The page auto-reloads when `ui_version` changes so an open tab never runs stale
   assets after a deploy.
@@ -131,8 +143,9 @@ curl -sN localhost:8787/events | head -c 300
 ```
 
 There is no test suite; the check is: it starts with a real metrics endpoint, `/healthz`
-is `ok`, `/api/stats` carries `totals`, `session`, `costs`, `gpus`, and the page renders
-in both themes with and without GPU data. Keep `python3 -c "import ast,sys;ast.parse(open('server.py').read())"`
+is `ok`, `/api/stats` carries `totals`, `session`, `costs`, `gpus`, `cpu`, and the page
+renders in all three themes with and without GPU data and with and without host CPU
+sensors. Keep `python3 -c "import ast,sys;ast.parse(open('server.py').read())"`
 green, and keep the file importable with no side effects until `main()` runs.
 
 ## Extending it

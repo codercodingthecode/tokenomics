@@ -70,6 +70,7 @@ STATIC_FILES = {
     "index.html": "text/html; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
+    "charts.js": "text/javascript; charset=utf-8",
 }
 # changes whenever a static file changes; the page reloads itself when it sees a new value
 UI_VERSION = str(int(max(os.path.getmtime(os.path.join(HERE, "static", n)) for n in STATIC_FILES)))
