@@ -526,7 +526,7 @@ class Poller(threading.Thread):
         super().__init__(daemon=True)
         self.cfg = cfg
         self.state = State(cfg.state_path)
-        self.clients = set()
+        self.clients = {}  # client queue -> history window (minutes) the UI asked to be pushed
         self.clients_lock = threading.Lock()
         self.history = History(cfg.history_db, cfg.history_ttl_days * 86400)
         self.snapshot = {"ok": False, "error": "starting", "updated_at": iso(now_ts())}
@@ -728,30 +728,42 @@ class Poller(threading.Thread):
                 snap["updated_at"] = iso(ts)
                 self.snapshot = snap
                 self.prev = None
+            try:
+                self.snapshot["vllm"] = DOCKER.status()
+            except Exception as e:
+                self.snapshot["vllm"] = {"available": False, "error": str(e)}
             self.broadcast()
             time.sleep(self.cfg.poll_interval)
 
+    def frame(self, minutes):
+        """Snapshot JSON for one client: windows longer than the live one are served from SQLite."""
+        if minutes > self.cfg.history_minutes:
+            view = dict(self.snapshot)
+            view["history"] = self.history.rows(now_ts() - minutes * 60)
+        else:
+            view = self.snapshot
+        return json.dumps(view)
+
     def broadcast(self):
-        data = json.dumps(self.snapshot)
         with self.clients_lock:
             dead = []
-            for q in self.clients:
+            for q, minutes in list(self.clients.items()):
                 try:
-                    q.put_nowait(data)
+                    q.put_nowait(self.frame(minutes))
                 except queue.Full:
                     dead.append(q)
             for q in dead:
-                self.clients.discard(q)
+                self.clients.pop(q, None)
 
-    def subscribe(self):
+    def subscribe(self, minutes):
         q = queue.Queue(maxsize=8)
         with self.clients_lock:
-            self.clients.add(q)
+            self.clients[q] = int(minutes)
         return q
 
     def unsubscribe(self, q):
         with self.clients_lock:
-            self.clients.discard(q)
+            self.clients.pop(q, None)
 
 
 POLLER = None
@@ -917,15 +929,21 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, json.dumps({"error": "not found"}))
 
     def sse(self):
+        qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+        try:
+            minutes = float(qs.get("minutes", [POLLER.cfg.history_minutes])[0])
+        except ValueError:
+            minutes = POLLER.cfg.history_minutes
+        minutes = max(1.0, min(minutes, POLLER.cfg.history_ttl_days * 1440))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
-        q = POLLER.subscribe()
+        q = POLLER.subscribe(minutes)
         try:
-            self.wfile.write(("data: " + json.dumps(POLLER.snapshot) + "\n\n").encode())
+            self.wfile.write(("data: " + POLLER.frame(minutes) + "\n\n").encode())
             self.wfile.flush()
             while True:
                 try:

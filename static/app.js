@@ -25,9 +25,9 @@
     // series colors are CSS custom properties, so the panes repaint themselves
   });
   let lastSnap = null;
+  let paintVllm = null;   // set by the vllmControl IIFE; render() calls it with snap.vllm
   let scopeMode = "total";
-  let rangeMin = 15;          // chart window in minutes; the live snapshot carries history_minutes of it
-  let rangeData = null;       // points fetched from /api/history for a non-live range
+  let rangeMin = 15;          // chart window in minutes; the SSE stream is subscribed with this window
 
   // ---------- formatting ----------
   const fmtInt = n => n == null ? "–" : Math.round(n).toLocaleString("en-US");
@@ -159,6 +159,7 @@
     if (s.source) { $("srcLabel").textContent = s.source.label || ""; $("model").textContent = s.source.model || ""; }
     renderGPUs(s);
     renderCPU(s);
+    if (paintVllm && s.vllm) paintVllm(s.vllm);
     if (!s.live) return;
     const L = s.live, sc = scopeData(s), T = sc.totals, P = sc.pod;
 
@@ -377,10 +378,9 @@
     });
   }
 
-  // the live window rides on the snapshot; anything longer was fetched into rangeData
+  // the chart window always rides on the snapshot: the stream pushes the selected range
   function currentRows() {
-    if (lastSnap && rangeMin === ((lastSnap.history_minutes) || 60)) return lastSnap.history || [];
-    return rangeData || [];
+    return (lastSnap && lastSnap.history) || [];
   }
 
   function foot(id, st, fmt, extra) {
@@ -467,13 +467,6 @@
   // ---------- chart range: the live window rides on the snapshot; longer ranges come from SQLite ----------
   const rangeBtns = Array.prototype.slice.call(document.querySelectorAll(".range button"));
   const rangeNames = { 15: "last 15 minutes", 60: "last hour", 360: "last 6 hours", 1440: "last 24 hours", 10080: "last 7 days" };
-  function fetchRange() {
-    if (rangeMin === ((lastSnap && lastSnap.history_minutes) || 60)) return;
-    fetch("/api/history?minutes=" + rangeMin).then(r => r.json()).then(j => {
-      rangeData = j.points || [];
-      drawAll();
-    }).catch(() => {});
-  }
   // both the throughput card and the CPU card carry a range picker: they are one control, twice painted
   function setRange(min) {
     rangeMin = Number(min);
@@ -486,13 +479,9 @@
     $("rangeLabel").textContent = label;
     const l2 = $("sysRangeLabel");
     if (l2) l2.textContent = label;
-    rangeData = null;
-    if (lastSnap && rangeMin === (lastSnap.history_minutes || 60)) drawAll();
-    else fetchRange();
+    connect(); // re-subscribe: the stream now carries this window (first frame lands within one poll)
   }
   rangeBtns.forEach(b => b.addEventListener("click", () => setRange(b.dataset.min)));
-  setInterval(fetchRange, 30000);
-  fetchRange(); // paint the non-default default range right away (the snapshot only carries history_minutes)
 
   linkCharts([chartThroughput, chartTemp, chartClock, chartLoad]);
   // the viewBox is measured in CSS pixels, so a resize has to redraw the axes rather than stretch them
@@ -510,12 +499,17 @@
 
   // ---------- live feed: SSE with polling fallback ----------
   setInterval(() => { if (lastSnap && lastSnap.updated_at) $("updated").textContent = ago(lastSnap.updated_at); }, 1000);
+  let es = null;
   function connect() {
-    let es;
-    try { es = new EventSource("/events"); } catch (e) { return poll(); }
-    es.onmessage = ev => { try { render(JSON.parse(ev.data)); } catch (e) {} };
-    es.onerror = () => {
-      es.close();
+    if (es) { try { es.close(); } catch (e) {} es = null; }
+    let next;
+    try { next = new EventSource("/events?minutes=" + rangeMin); } catch (e) { return poll(); }
+    es = next;
+    next.onmessage = ev => { try { render(JSON.parse(ev.data)); } catch (e) {} };
+    next.onerror = () => {
+      try { next.close(); } catch (e) {}
+      if (es !== next) return; // superseded by a range-switch reconnect
+      es = null;
       $("status").className = "status";
       $("statusText").textContent = "reconnecting";
       setTimeout(connect, 3000);
@@ -534,6 +528,7 @@
       bStop.disabled = busy || !cStop;
       bRestart.disabled = busy || !cRestart;
     }
+    paintVllm = paint;
     function paint(s) {
       pill.className = "vllm-pill";
       if (!s || s.available === false) {
@@ -555,7 +550,6 @@
         state.textContent = "container exists, stopped"; setBtns(true, false, true);
       }
     }
-    function refresh() { fetch("/api/vllm").then(r => r.json()).then(paint).catch(() => paint(null)); }
     function act(a) {
       if (busy) return;
       const warn = a === "start"
@@ -565,13 +559,12 @@
       busy = true; msg.textContent = a + "ing\u2026"; setBtns(false, false, false);
       fetch("/api/vllm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: a }) })
         .then(r => r.json())
-        .then(j => { busy = false; msg.textContent = j.ok ? (a + " sent") : ("error: " + (j.error || "?")); paint(j.vllm || null); setTimeout(refresh, 1500); })
-        .catch(() => { busy = false; msg.textContent = "request failed"; refresh(); });
+        .then(j => { busy = false; msg.textContent = j.ok ? (a + " sent") : ("error: " + (j.error || "?")); paint(j.vllm || null); })
+        .catch(() => { busy = false; msg.textContent = "request failed"; });
     }
     bStart.addEventListener("click", () => act("start"));
     bStop.addEventListener("click", () => act("stop"));
     bRestart.addEventListener("click", () => act("restart"));
-    refresh(); setInterval(refresh, 5000);
   })();
   connect();
 })();
