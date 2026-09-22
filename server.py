@@ -736,8 +736,9 @@ class Poller(threading.Thread):
             time.sleep(self.cfg.poll_interval)
 
     def frame(self, minutes):
-        """Snapshot JSON for one client: windows longer than the live one are served from SQLite."""
-        if minutes > self.cfg.history_minutes:
+        """Snapshot JSON for one client. The chart window is whatever the client asked for:
+        anything other than the live window baked into the snapshot is sliced from SQLite."""
+        if minutes != self.cfg.history_minutes:
             view = dict(self.snapshot)
             view["history"] = self.history.rows(now_ts() - minutes * 60)
         else:
