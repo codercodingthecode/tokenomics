@@ -83,25 +83,30 @@
     return ["crit", "critical"];
   }
   function gpuSpark(idx, hist) {
-    const series = [];
+    const junc = [], edge = [], mem = [];
     for (const h of (hist || [])) {
       const g = (h.gpus || []).find(x => x.index === idx);
       if (!g) continue;
-      const v = g.junction_c != null ? g.junction_c : g.edge_c;
-      if (v != null) series.push({ t: h.t, v });
+      const j = g.junction_c != null ? g.junction_c : g.edge_c;
+      if (j != null) junc.push({ t: h.t, v: j });
+      if (g.edge_c != null) edge.push({ t: h.t, v: g.edge_c });
+      if (g.mem_c != null) mem.push({ t: h.t, v: g.mem_c });
     }
-    if (series.length < 2) return "";
+    if (junc.length < 2) return "";
     const W = 200, H = 40, padT = 4, padB = 4;
-    const t0 = series[0].t, t1 = series[series.length - 1].t || t0 + 1;
-    const vmin = Math.min(...series.map(d => d.v)), vmax = Math.max(...series.map(d => d.v));
+    const all = junc.concat(edge, mem);
+    const t0 = all[0].t, t1 = all[all.length - 1].t || t0 + 1;
+    const vmin = Math.min(...all.map(d => d.v)), vmax = Math.max(...all.map(d => d.v));
     const span = Math.max(vmax - vmin, 5);
     const lo = vmin - span * 0.15, hi = vmax + span * 0.15;
     const x = t => (t - t0) / Math.max(t1 - t0, 1) * W;
     const y = v => padT + (H - padT - padB) * (1 - (v - lo) / (hi - lo));
-    const path = series.map((d, i) => (i ? "L" : "M") + x(d.t).toFixed(1) + " " + y(d.v).toFixed(1)).join(" ");
-    const last = series[series.length - 1];
+    const mk = (s, col, w, op) => s.length > 1
+      ? `<path d="${s.map((d, i) => (i ? "L" : "M") + x(d.t).toFixed(1) + " " + y(d.v).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="${w}" opacity="${op}" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>`
+      : "";
+    const last = junc[junc.length - 1];
     const col = "var(--" + tempClass(last.v) + ")";
-    return `<path d="${path}" fill="none" stroke="${col}" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>` +
+    return mk(edge, "var(--gpu-edge)", 1, .8) + mk(mem, "var(--gpu-mem)", 1, .8) + mk(junc, col, 1.5, 1) +
       `<circle cx="${x(last.t).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="2" fill="${col}"/>`;
   }
   function gpuCard(g, hist) {
@@ -134,7 +139,7 @@
           <div class="gpu-metric-sub">cap <b>${cap}</b> \u00b7 <b>${freq}</b> \u00b7 <b>${fan}</b></div>
         </div>
       </div>
-      <div class="gpu-spark-wrap"><div class="gpu-spark-label">junction temp \u00b7 last 15 min</div>
+      <div class="gpu-spark-wrap"><div class="gpu-spark-label">temps \u00b7 last 15 min<span class="gsl"><i style="background:var(--${tc})"></i>junc</span><span class="gsl"><i style="background:var(--gpu-edge)"></i>edge</span><span class="gsl"><i style="background:var(--gpu-mem)"></i>mem</span></div>
         <svg class="gpu-spark" viewBox="0 0 200 40" preserveAspectRatio="none">${gpuSpark(g.index, hist)}</svg></div>
     </div>`;
   }

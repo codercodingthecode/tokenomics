@@ -98,7 +98,9 @@ downstream.
 
 `read_gpus()` walks `/sys/class/drm/card*/device/hwmon/hwmon*` for amdgpu
 (edge/junction/memory temperature, power draw, cap, fan, clock) and keeps a
-180-sample ring buffer for sparklines. The GPU card surfaces junction temp as
+15-minute ring buffer for sparklines (scaled to the poll interval). The sparkline
+draws all three temps: junction as the primary heat-colored line, edge and mem as
+thinner fixed-color lines with a legend. The GPU card surfaces junction temp as
 the primary number (edge + mem are secondary); the `gpu_c` history sample is
 the hottest junction across all GPUs. `read_cpu()` uses `/proc/stat`, `/proc/loadavg`,
 `hwmon` (`k10temp`/`zenpower`) and `cpufreq`. Both return empty when the paths are
