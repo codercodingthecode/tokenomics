@@ -89,7 +89,7 @@ downstream.
 - `state.json`: `baseline`, `last_raw`, `resets`, `session {started_at, totals}`.
   Written atomically (`.tmp` + rename) after every poll. Delete it to count from zero.
 - Counter reset detection is "any counter decreased". If the server restarts and serves
-  more than its previous lifetime before the next poll, the reset is missed; a 5 s poll
+  more than its previous lifetime before the next poll, the reset is missed; second-scale polling
   makes that vanishingly unlikely.
 - `history.sqlite` (WAL): `samples` (per poll) pruned by `history_ttl_days`, `ledger`
   (one row per UTC day) never pruned - all-time totals are a feature.

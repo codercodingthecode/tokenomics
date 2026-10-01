@@ -533,7 +533,7 @@ class Poller(threading.Thread):
         self.snapshot = {"ok": False, "error": "starting", "updated_at": iso(now_ts())}
         self.prev = None  # (ts, totals) for rate computation
         self.prev_running = None  # llama.cpp request synthesis: last requests_processing gauge
-        self.gpu_history = deque(maxlen=180)  # ~15 min of GPU readings at a 5 s poll
+        self.gpu_history = deque(maxlen=max(180, int(900 / self.cfg.poll_interval)))  # 15 min of GPU readings regardless of poll interval
 
     def fetch(self):
         # Cloudflare-fronted endpoints 403 (error 1010) the default "Python-urllib" agent
