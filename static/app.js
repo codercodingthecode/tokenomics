@@ -167,6 +167,7 @@
     if (s.source) { $("srcLabel").textContent = s.source.label || ""; $("model").textContent = s.source.model || ""; }
     renderGPUs(s);
     renderCPU(s);
+    renderKV(s);
     if (paintVllm && s.vllm) paintVllm(s.vllm);
     if (!s.live) return;
     const L = s.live, sc = scopeData(s), T = sc.totals, P = sc.pod;
@@ -372,7 +373,42 @@
     emptyHtml: "no /proc/stat access",
   });
 
-  // one x domain across the four panes: sweeping one sweeps all, so a spike lines up everywhere
+  const kvGbmin = v => v == null ? "\u2013" : (v >= 10 ? v.toFixed(1) : v.toFixed(2)) + " GB/min";
+  const chartKvG = TC.makeChart({
+    svg: $("svgKvG"), wrap: $("kvGChart"), tip: $("tipKvG"),
+    label: "GPU KV cache usage in percent, with store and load transfer rates in GB per minute",
+    unit: "%", yLo: 0, yTicks: 4,
+    series: [
+      { get: d => d.kv, color: "line", width: 2, area: .2 },
+      { get: d => d.kv_store_gbps, color: "text-3", width: 1.25, dash: "5 5", noDot: true, noPill: true },
+      { get: d => d.kv_load_gbps, color: "good", width: 1.75, noPill: true },
+    ],
+    tipRows: row => tipHead(row) + tipBody([
+      ["gpu kv", fmtPct(row.kv), "v-big"],
+      ["store \u2192 ram", kvGbmin(row.kv_store_gbps)],
+      ["load \u2190 ram", kvGbmin(row.kv_load_gbps)],
+      ["running", row.running == null ? null : v0(row.running)],
+    ]),
+    emptyHtml: "no kv samples yet",
+  });
+  const chartKvR = TC.makeChart({
+    svg: $("svgKvR"), wrap: $("kvRChart"), tip: $("tipKvR"),
+    label: "RAM KV tier pinned in percent, with store and load transfer rates in GB per minute",
+    unit: "%", yLo: 0, yTicks: 4,
+    series: [
+      { get: d => d.ram_kv, color: "power", width: 2, area: .2 },
+      { get: d => d.kv_store_gbps, color: "text-3", width: 1.25, dash: "5 5", noDot: true, noPill: true },
+      { get: d => d.kv_load_gbps, color: "good", width: 1.75, noPill: true },
+    ],
+    tipRows: row => tipHead(row) + tipBody([
+      ["ram pinned", fmtPct(row.ram_kv), "v-big"],
+      ["store \u2192 ram", kvGbmin(row.kv_store_gbps)],
+      ["load \u2190 ram", kvGbmin(row.kv_load_gbps)],
+    ]),
+    emptyHtml: "no kv samples yet",
+  });
+
+  // one x domain across the time-series panes: sweeping one sweeps all, so a spike lines up everywhere
   function linkCharts(list) {
     list.forEach(c => {
       const el = c.el();
@@ -433,6 +469,8 @@
     for (const r of rows) peak = Math.max(peak, r.gen_tps || 0);
     setIdle(rows.length > 1 && peak === 0);
     chartThroughput.draw(rows);
+    chartKvG.draw(rows);
+    chartKvR.draw(rows);
   }
 
   function renderCPU(s) {
@@ -464,6 +502,57 @@
       "All of it is read off the host that runs the server, so a container needs its <code>/sys</code> bind mounts \u2014 " +
       "a gap in a line means the sensor was absent then, not that the host was idle.";
   }
+  // ---------- KV cache tiers (GPU VRAM + RAM offload) ----------
+  function renderKV(s) {
+    const card = $("kvCard");
+    if (!card) return;
+    const K = s.kv;
+    card.classList.toggle("card-hidden", !K);
+    if (!K) return;
+    const G = K.gpu || {}, R = K.ram || {};
+    const since = K.since_restart || K.first_seen;
+    $("kvSub").textContent = [G.capacity_tokens ? "VRAM " + compact(G.capacity_tokens) + " tok" : null,
+      R.capacity_gb ? "RAM " + R.capacity_gb.toFixed(1) + " GiB" : null].filter(Boolean).join(" \u00b7 ");
+    setVal("kvGpuNow", G.usage_pct == null ? "\u2013" : G.usage_pct.toFixed(1) + "%");
+    const gb = $("kvGpuBar");
+    if (gb) {
+      gb.style.width = (G.usage_pct == null ? 0 : Math.max(0, Math.min(100, G.usage_pct))).toFixed(1) + "%";
+      gb.className = G.usage_pct == null ? "" : G.usage_pct < 60 ? "" : G.usage_pct < 80 ? "warm" : G.usage_pct < 92 ? "hot" : "crit";
+    }
+    $("kvGpuTokens").textContent = G.tokens == null ? "\u2013" : compact(G.tokens);
+    $("kvGpuCap").textContent = G.capacity_tokens ? "of " + compact(G.capacity_tokens) : "";
+    $("kvGpuHit60").textContent = G.hit_rate_60s == null ? "\u2013" : (100 * G.hit_rate_60s).toFixed(1) + "%";
+    $("kvGpuHitAll").textContent = G.hit_rate_since_restart == null ? "\u2013" : (100 * G.hit_rate_since_restart).toFixed(1) + "%";
+    $("kvGpuQueue").textContent = (G.running == null ? "\u2013" : fmtInt(G.running)) + " running \u00b7 " +
+      (G.waiting == null ? "\u2013" : fmtInt(G.waiting)) + " waiting \u00b7 " +
+      (G.preemptions == null ? "\u2013" : fmtInt(G.preemptions)) + " preempted";
+    $("kvGpuFoot").innerHTML = since ? "since <b>" + fmtDate(since) + "</b>" +
+      (K.restarts_seen ? " \u00b7 " + K.restarts_seen + " restarts absorbed" : "") : "\u2013";
+    setVal("kvRamNow", R.usage_gb == null ? "\u2013" : R.usage_gb.toFixed(2) + " GB");
+    const rb = $("kvRamBar");
+    if (rb) {
+      const w = R.usage_pct == null ? 0 : Math.max(0, Math.min(100, R.usage_pct));
+      rb.style.width = w.toFixed(1) + "%";
+      rb.className = w >= 80 ? "hot" : "";
+    }
+    setVal("kvRamRestores", R.load_chunks == null ? "\u2013" : fmtInt(R.load_chunks));
+    const gb1 = v => v == null ? "\u2013" : (v >= 10 ? v.toFixed(1) : v.toFixed(2)) + " GB";
+    $("kvRamLoad").textContent = R.load_gb == null ? "\u2013" : gb1(R.load_gb) + " \u00b7 " + (R.load_chunks == null ? "\u2013" : fmtInt(R.load_chunks)) + " chunks";
+    $("kvRamLoadRate").textContent = R.load_gbps == null ? "" : kvGbmin(R.load_gbps);
+    $("kvRamStore").textContent = R.store_gb == null ? "\u2013" : gb1(R.store_gb) + " \u00b7 " + (R.store_chunks == null ? "\u2013" : fmtInt(R.store_chunks)) + " chunks";
+    $("kvRamStoreRate").textContent = R.store_gbps == null ? "" : kvGbmin(R.store_gbps);
+    $("kvRamMbps").textContent = (R.store_mbps == null && R.load_mbps == null) ? "\u2013" :
+      "store " + (R.store_mbps == null ? "\u2013" : fmtInt(R.store_mbps) + " MB/s") +
+      " \u00b7 load " + (R.load_mbps == null ? "\u2013" : fmtInt(R.load_mbps) + " MB/s");
+    $("kvRamTokens").textContent = R.ext_tokens_since_restart == null ? "\u2013" : compact(R.ext_tokens_since_restart) + " tok";
+    const hr60 = R.ext_hit_rate_60s == null ? null : (100 * R.ext_hit_rate_60s).toFixed(1) + "%";
+    const hrAll = R.ext_hit_rate_since_restart == null ? null : (100 * R.ext_hit_rate_since_restart).toFixed(1) + "%";
+    $("kvRamTokensSub").textContent = [hr60 != null ? "60 s " + hr60 : null, hrAll != null ? "since restart " + hrAll : null]
+      .filter(Boolean).join(" \u00b7 ");
+    $("kvRamFoot").innerHTML = since ? "since <b>" + fmtDate(since) + "</b>" +
+      (R.capacity_gb ? " \u00b7 " + R.capacity_gb.toFixed(1) + " GiB tier" : "") : "\u2013";
+  }
+
   // ---------- scope toggle ----------
   const scopeBtns = Array.prototype.slice.call(document.querySelectorAll("#scope button"));
   scopeBtns.forEach(b => b.addEventListener("click", () => {
@@ -487,11 +576,13 @@
     $("rangeLabel").textContent = label;
     const l2 = $("sysRangeLabel");
     if (l2) l2.textContent = label;
+    const l3 = $("kvRangeLabel");
+    if (l3) l3.textContent = label;
     connect(); // re-subscribe: the stream now carries this window (first frame lands within one poll)
   }
   rangeBtns.forEach(b => b.addEventListener("click", () => setRange(b.dataset.min)));
 
-  linkCharts([chartThroughput, chartTemp, chartClock, chartLoad]);
+  linkCharts([chartThroughput, chartTemp, chartClock, chartLoad, chartKvG, chartKvR]);
   // the viewBox is measured in CSS pixels, so a resize has to redraw the axes rather than stretch them
   let resizeTimer = null;
   function onResize() {
@@ -500,7 +591,7 @@
   }
   if (window.ResizeObserver) {
     const ro = new ResizeObserver(onResize);
-    ["chart", "cpuTChart", "cpuSChart", "cpuLChart"].forEach(id => { const el = $(id); if (el) ro.observe(el); });
+    ["chart", "cpuTChart", "cpuSChart", "cpuLChart", "kvGChart", "kvRChart"].forEach(id => { const el = $(id); if (el) ro.observe(el); });
   } else {
     window.addEventListener("resize", onResize);
   }

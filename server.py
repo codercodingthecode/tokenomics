@@ -41,13 +41,27 @@ COUNTERS = [
     "spec_decode_num_draft_tokens_total",
     "spec_decode_num_accepted_tokens_total",
     "num_preemptions_total",
+    "prefix_cache_hits_total",
+    "prefix_cache_queries_total",
+    "external_prefix_cache_hits_total",
+    "external_prefix_cache_queries_total",
+    "kv_offload_store_bytes_total",
+    "kv_offload_store_time_total",
+    "kv_offload_store_size_count",
+    "kv_offload_load_bytes_total",
+    "kv_offload_load_time_total",
+    "kv_offload_load_size_count",
     "inter_token_latency_seconds_sum",
     "inter_token_latency_seconds_count",
     "e2e_request_latency_seconds_sum",
     "e2e_request_latency_seconds_count",
     "gen_seconds_total",  # llama.cpp only: total wall-time spent generating tokens
 ]
-GAUGES = ["num_requests_running", "num_requests_waiting", "kv_cache_usage_perc"]
+GAUGES = [
+    "num_requests_running", "num_requests_waiting", "kv_cache_usage_perc",
+    "kv_offload_cpu_cache_usage_perc", "kv_offload_cpu_cache_read_usage_perc",
+    "kv_offload_cpu_cache_write_usage_perc",
+]
 
 METRIC_RE = re.compile(r"^(?:vllm:|llamacpp:)(\w+)(?:\{([^}]*)\})?\s+([-+0-9.eE]+|NaN)\s*$")
 
@@ -122,6 +136,10 @@ class Config:
         cpu = self.raw.get("cpu", {})
         self.cpu_hwmon = cpu.get("hwmon", "/sys/class/hwmon")            # k10temp / zenpower
         self.cpu_sysfs = cpu.get("sysfs", "/sys/devices/system/cpu")     # per-core cpufreq
+        kv = self.raw.get("kv", {})
+        # KV tier capacities: turn usage fractions into tokens (VRAM) and GB (RAM offload tier)
+        self.kv_gpu_capacity = float(kv.get("gpu_capacity_tokens", 547295))
+        self.kv_ram_capacity = float(kv.get("ram_capacity_bytes", 25760000000))
         self.state_path = os.environ.get("TOKENOMICS_STATE") or os.path.join(HERE, self.raw.get("state_file", "state.json"))
         os.makedirs(os.path.dirname(os.path.abspath(self.state_path)), exist_ok=True)
         # per-poll samples live in SQLite next to state.json unless overridden
@@ -146,6 +164,7 @@ class State:
         self.last_raw = {k: 0.0 for k in COUNTERS}   # last raw value seen from vLLM
         self.first_seen = None
         self.resets = 0
+        self.last_reset_at = None
         self.extra_requests = 0.0   # synthetic request counter for llama.cpp (0->N running transitions)
         self.session = None  # {"started_at": ts, "totals": {counter: value}} — this deployment's window
         self.load()
@@ -158,6 +177,7 @@ class State:
             self.last_raw.update(d.get("last_raw", {}))
             self.first_seen = d.get("first_seen")
             self.resets = d.get("resets", 0)
+            self.last_reset_at = d.get("last_reset_at")
             self.extra_requests = float(d.get("extra_requests", 0.0))
             s = d.get("session")
             if isinstance(s, dict) and s.get("started_at") and isinstance(s.get("totals"), dict):
@@ -170,6 +190,7 @@ class State:
         with open(tmp, "w") as f:
             json.dump({"baseline": self.baseline, "last_raw": self.last_raw,
                        "first_seen": self.first_seen, "resets": self.resets,
+                       "last_reset_at": self.last_reset_at,
                        "extra_requests": self.extra_requests, "session": self.session}, f, indent=1)
         os.replace(tmp, self.path)
 
@@ -185,6 +206,7 @@ class State:
             for k in COUNTERS:
                 self.baseline[k] += self.last_raw.get(k, 0.0)
             self.resets += 1
+            self.last_reset_at = now_ts()
         for k in COUNTERS:
             self.last_raw[k] = raw.get(k, 0.0)
         if self.first_seen is None:
@@ -428,8 +450,14 @@ class History:
 
     COLS = ["t", "gen_tps", "gen_tps_avg", "prompt_tps", "running", "waiting", "kv",
             "prompt_tokens", "cached_tokens", "gen_tokens", "requests",
-            "cpu_c", "cpu_ghz", "cpu_pct", "load1", "gpu_c"]
-    EXTRA_COLS = [("cpu_c", "REAL"), ("cpu_ghz", "REAL"), ("cpu_pct", "REAL"), ("load1", "REAL"), ("gpu_c", "REAL")]
+            "cpu_c", "cpu_ghz", "cpu_pct", "load1", "gpu_c",
+            "ram_kv", "kv_store_gbps", "kv_load_gbps",
+            "px_hits", "px_queries", "ext_hits", "ext_queries",
+            "kv_store_bytes", "kv_load_bytes"]
+    EXTRA_COLS = [("cpu_c", "REAL"), ("cpu_ghz", "REAL"), ("cpu_pct", "REAL"), ("load1", "REAL"), ("gpu_c", "REAL"),
+                  ("ram_kv", "REAL"), ("kv_store_gbps", "REAL"), ("kv_load_gbps", "REAL"),
+                  ("px_hits", "REAL"), ("px_queries", "REAL"), ("ext_hits", "REAL"), ("ext_queries", "REAL"),
+                  ("kv_store_bytes", "REAL"), ("kv_load_bytes", "REAL")]
 
     def __init__(self, path, ttl_seconds):
         self.path = path
@@ -443,7 +471,10 @@ class History:
             "CREATE TABLE IF NOT EXISTS samples (t REAL PRIMARY KEY, gen_tps REAL, gen_tps_avg REAL, "
             "prompt_tps REAL, running INTEGER, waiting INTEGER, kv REAL, "
             "prompt_tokens REAL, cached_tokens REAL, gen_tokens REAL, requests REAL, "
-            "cpu_c REAL, cpu_ghz REAL, cpu_pct REAL, load1 REAL, gpu_c REAL)")
+            "cpu_c REAL, cpu_ghz REAL, cpu_pct REAL, load1 REAL, gpu_c REAL, "
+            "ram_kv REAL, kv_store_gbps REAL, kv_load_gbps REAL, "
+            "px_hits REAL, px_queries REAL, ext_hits REAL, ext_queries REAL, "
+            "kv_store_bytes REAL, kv_load_bytes REAL)")
         # databases created before the CPU panel only have the first 11 columns: ADD COLUMN keeps them
         have = {r[1] for r in self.db.execute("PRAGMA table_info(samples)")}
         for name, sqlt in self.EXTRA_COLS:
@@ -495,7 +526,10 @@ class History:
                 cur = self.db.execute(
                     "SELECT MIN(t), AVG(gen_tps), AVG(gen_tps_avg), AVG(prompt_tps), MAX(running), MAX(waiting), AVG(kv), "
                     "MAX(prompt_tokens), MAX(cached_tokens), MAX(gen_tokens), MAX(requests), "
-                    "AVG(cpu_c), AVG(cpu_ghz), AVG(cpu_pct), AVG(load1), MAX(gpu_c) FROM samples "
+                    "AVG(cpu_c), AVG(cpu_ghz), AVG(cpu_pct), AVG(load1), MAX(gpu_c), "
+                    "AVG(ram_kv), AVG(kv_store_gbps), AVG(kv_load_gbps), "
+                    "MAX(px_hits), MAX(px_queries), MAX(ext_hits), MAX(ext_queries), "
+                    "MAX(kv_store_bytes), MAX(kv_load_bytes) FROM samples "
                     "WHERE t >= ? AND t <= ? GROUP BY CAST((t - ?) / ? AS INTEGER) ORDER BY 1",
                     (since, until, since, step))
             out = [dict(zip(self.COLS, r)) for r in cur.fetchall()]
@@ -619,6 +653,7 @@ class Poller(threading.Thread):
         accepted = totals["spec_decode_num_accepted_tokens_total"]
 
         rates = {"gen_tps": 0.0, "prompt_tps": 0.0, "itl_ms": None, "accept_rate": None}
+        store_gbps, load_gbps = None, None   # KV offload tier transfer, GB/min over the last poll
         if self.prev:
             pts, p = self.prev
             dt = max(ts - pts, 1e-6)
@@ -638,6 +673,9 @@ class Poller(threading.Thread):
             da = accepted - p["spec_decode_num_accepted_tokens_total"]
             if dd > 0:
                 rates["accept_rate"] = da / dd
+            GB = 2.0 ** 30
+            store_gbps = max(totals["kv_offload_store_bytes_total"] - p["kv_offload_store_bytes_total"], 0.0) / dt * 60.0 / GB
+            load_gbps = max(totals["kv_offload_load_bytes_total"] - p["kv_offload_load_bytes_total"], 0.0) / dt * 60.0 / GB
         self.prev = (ts, dict(totals))
 
         # smoothed throughput: trailing mean over cfg.smoothing_seconds of history (+ this poll)
@@ -651,6 +689,65 @@ class Poller(threading.Thread):
         if sess:
             sess_counts = {k: max(totals[k] - sess["totals"].get(k, 0.0), 0.0) for k in COUNTERS}
             session_view = self.scope_view(cfg, ts, sess_counts, sess["started_at"])
+
+        # KV-cache tiers: the VRAM pool + the CPU offload tier (radiance kv_offloading).
+        # Since-restart numbers are state.last_raw (the current vLLM lifetime); the restart
+        # time is state.last_reset_at. 60-s rates come off the oldest sample in the window.
+        kv_block = None
+        if not is_llama:
+            raw = self.state.last_raw
+            g = gauges
+            GB = 2.0 ** 30
+            w0 = (self.history.rows(ts - 60.0, ts) or [None])[0]
+
+            def delta60(col, cur):
+                if not w0 or w0.get(col) is None:
+                    return None
+                return max(cur - w0[col], 0.0)
+
+            px_h, px_q = raw["prefix_cache_hits_total"], raw["prefix_cache_queries_total"]
+            ext_h, ext_q = raw["external_prefix_cache_hits_total"], raw["external_prefix_cache_queries_total"]
+            st_b, st_t, st_c = raw["kv_offload_store_bytes_total"], raw["kv_offload_store_time_total"], raw["kv_offload_store_size_count"]
+            ld_b, ld_t, ld_c = raw["kv_offload_load_bytes_total"], raw["kv_offload_load_time_total"], raw["kv_offload_load_size_count"]
+            d_px_h, d_px_q = delta60("px_hits", totals["prefix_cache_hits_total"]), delta60("px_queries", totals["prefix_cache_queries_total"])
+            d_ext_h, d_ext_q = delta60("ext_hits", totals["external_prefix_cache_hits_total"]), delta60("ext_queries", totals["external_prefix_cache_queries_total"])
+            kv_block = {
+                "since_restart": iso(self.state.last_reset_at) if self.state.last_reset_at else None,
+                "first_seen": iso(self.state.first_seen) if self.state.first_seen else None,
+                "restarts_seen": self.state.resets,
+                "gpu": {
+                    "capacity_tokens": cfg.kv_gpu_capacity,
+                    "usage_pct": 100.0 * g["kv_cache_usage_perc"],
+                    "tokens": g["kv_cache_usage_perc"] * cfg.kv_gpu_capacity,
+                    "hit_rate_60s": (d_px_h / d_px_q) if d_px_h is not None and d_px_q > 0 else None,
+                    "hit_rate_since_restart": (px_h / px_q) if px_q > 0 else None,
+                    "hits_since_restart": px_h,
+                    "queries_since_restart": px_q,
+                    "running": g["num_requests_running"],
+                    "waiting": g["num_requests_waiting"],
+                    "preemptions": raw["num_preemptions_total"],
+                },
+                "ram": {
+                    "capacity_bytes": cfg.kv_ram_capacity,
+                    "capacity_gb": cfg.kv_ram_capacity / GB,
+                    "usage_pct": 100.0 * g["kv_offload_cpu_cache_usage_perc"],
+                    "usage_gb": g["kv_offload_cpu_cache_usage_perc"] * cfg.kv_ram_capacity / GB,
+                    "read_pct": 100.0 * g["kv_offload_cpu_cache_read_usage_perc"],
+                    "write_pct": 100.0 * g["kv_offload_cpu_cache_write_usage_perc"],
+                    "store_gbps": store_gbps,
+                    "load_gbps": load_gbps,
+                    "store_gb": st_b / GB,
+                    "store_chunks": st_c,
+                    "load_gb": ld_b / GB,
+                    "load_chunks": ld_c,
+                    "store_mbps": (st_b / st_t) / 1e6 if st_t > 0 else None,
+                    "load_mbps": (ld_b / ld_t) / 1e6 if ld_t > 0 else None,
+                    "ext_tokens_since_restart": ext_h,
+                    "ext_queries_since_restart": ext_q,
+                    "ext_hit_rate_60s": (d_ext_h / d_ext_q) if d_ext_h is not None and d_ext_q > 0 else None,
+                    "ext_hit_rate_since_restart": (ext_h / ext_q) if ext_q > 0 else None,
+                },
+            }
 
         return {
             "ok": True,
@@ -671,6 +768,7 @@ class Poller(threading.Thread):
                 "waiting": gauges["num_requests_waiting"],
                 "kv_cache_pct": None if is_llama else 100.0 * gauges["kv_cache_usage_perc"],
             },
+            "kv": kv_block,
             "totals": total_view["totals"],
             "pod": total_view["pod"],
             "costs": total_view["costs"],
@@ -708,6 +806,19 @@ class Poller(threading.Thread):
                 snap["gpu_history"] = list(self.gpu_history)
                 cpu = read_cpu(self.cfg.cpu_hwmon, self.cfg.cpu_sysfs)
                 snap["cpu"] = cpu
+                K = snap.get("kv") or {}
+                KR = K.get("ram") or {}
+                kv_sample = {} if is_llama else {
+                    "ram_kv": KR.get("usage_pct"),
+                    "kv_store_gbps": KR.get("store_gbps"),
+                    "kv_load_gbps": KR.get("load_gbps"),
+                    "px_hits": totals["prefix_cache_hits_total"],
+                    "px_queries": totals["prefix_cache_queries_total"],
+                    "ext_hits": totals["external_prefix_cache_hits_total"],
+                    "ext_queries": totals["external_prefix_cache_queries_total"],
+                    "kv_store_bytes": totals["kv_offload_store_bytes_total"],
+                    "kv_load_bytes": totals["kv_offload_load_bytes_total"],
+                }
                 L = snap["live"]
                 self.history.add({"t": ts, "gen_tps": L["gen_tps"], "gen_tps_avg": L["gen_tps_avg"],
                                   "prompt_tps": L["prompt_tps"], "running": L["running"],
@@ -719,11 +830,14 @@ class Poller(threading.Thread):
                                   "cpu_c": cpu.get("tctl_c"), "cpu_ghz": cpu.get("ghz_max"),
                                   "cpu_pct": cpu.get("pct"), "load1": cpu.get("load1"),
                                   "gpu_c": max([(g.get("junction_c") if g.get("junction_c") is not None else g.get("edge_c")) for g in gpus
-                                   if g.get("junction_c") is not None or g.get("edge_c") is not None] or [None])},
+                                   if g.get("junction_c") is not None or g.get("edge_c") is not None] or [None]),
+                                  **kv_sample},
                                  pod_usd=(snap.get("pod") or {}).get("usd"))
                 snap["history"] = self.history.rows(ts - self.cfg.history_minutes * 60, ts)
                 self.snapshot = snap
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as e:
+            # any exception here used to kill the poller thread silently (stale page, healthy /healthz);
+            # catch everything, surface it in the snapshot, keep polling.
+            except Exception as e:
                 snap = dict(self.snapshot)
                 snap["ok"] = False
                 snap["error"] = f"{type(e).__name__}: {e}"

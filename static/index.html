@@ -71,6 +71,55 @@
     <div class="gpu-grid" id="gpuGrid"></div>
   </section>
 
+  <section class="card kv-card" id="kvCard">
+    <div class="card-head head-3">
+      <h2>kv cache</h2>
+      <div class="range" id="rangeKv" role="group" aria-label="KV chart range">
+        <button type="button" data-min="15" class="on" aria-pressed="true">15m</button>
+        <button type="button" data-min="60" aria-pressed="false">1h</button>
+        <button type="button" data-min="360" aria-pressed="false">6h</button>
+        <button type="button" data-min="1440" aria-pressed="false">24h</button>
+        <button type="button" data-min="10080" aria-pressed="false">7d</button>
+      </div>
+      <span class="card-sub"><span id="kvRangeLabel">last 15 minutes</span> &middot; <span id="kvSub">vLLM KV tiers&hellip;</span></span>
+    </div>
+    <div class="kv-grid">
+      <div class="kv-pane">
+        <div class="sys-top"><span class="sys-label">gpu kv cache</span><span class="sys-now" id="kvGpuNow">&ndash;</span></div>
+        <div class="kpi-meter kv-meter" title="GPU KV cache usage"><i id="kvGpuBar"></i></div>
+        <div class="kv-rows">
+          <div class="kv-row"><span>tokens in cache</span><span class="kv-val"><b id="kvGpuTokens">&ndash;</b><i class="kv-cap" id="kvGpuCap"></i></span></div>
+          <div class="kv-row"><span>prefix hit &middot; 60 s</span><span class="kv-val"><b id="kvGpuHit60">&ndash;</b></span></div>
+          <div class="kv-row"><span>prefix hit &middot; since restart</span><span class="kv-val"><b id="kvGpuHitAll">&ndash;</b></span></div>
+          <div class="kv-row"><span>queue</span><span class="kv-val"><b id="kvGpuQueue">&ndash;</b></span></div>
+        </div>
+        <div class="chart chart-sm" id="kvGChart">
+          <svg id="svgKvG" preserveAspectRatio="none"></svg>
+          <div class="tip" id="tipKvG"></div>
+        </div>
+        <div class="sys-foot" id="kvGpuFoot">&ndash;</div>
+      </div>
+      <div class="kv-pane">
+        <div class="sys-top"><span class="sys-label">ram kv tier</span><span class="sys-now" id="kvRamNow">&ndash;</span></div>
+        <div class="kpi-meter kv-meter" title="RAM tier pinned by in-flight transfers"><i id="kvRamBar"></i></div>
+        <div class="kv-hero"><span class="kv-hero-label">RAM restores</span>
+          <span class="kv-hero-val flashy" id="kvRamRestores">&ndash;</span>
+          <span class="kv-hero-sub">chunks reloaded from RAM instead of rebuilt</span></div>
+        <div class="kv-rows">
+          <div class="kv-row"><span>load from RAM</span><span class="kv-val"><b id="kvRamLoad">&ndash;</b><i class="kv-cap" id="kvRamLoadRate"></i></span></div>
+          <div class="kv-row"><span>store to RAM</span><span class="kv-val"><b id="kvRamStore">&ndash;</b><i class="kv-cap" id="kvRamStoreRate"></i></span></div>
+          <div class="kv-row"><span>xfer speed (avg)</span><span class="kv-val"><b id="kvRamMbps">&ndash;</b></span></div>
+          <div class="kv-row"><span>tokens served from RAM</span><span class="kv-val"><b id="kvRamTokens">&ndash;</b><i class="kv-cap" id="kvRamTokensSub"></i></span></div>
+        </div>
+        <div class="chart chart-sm" id="kvRChart">
+          <svg id="svgKvR" preserveAspectRatio="none"></svg>
+          <div class="tip" id="tipKvR"></div>
+        </div>
+        <div class="sys-foot" id="kvRamFoot">&ndash;</div>
+      </div>
+    </div>
+  </section>
+
   <section class="card chart-card">
     <div class="card-head head-3">
       <h2>generation throughput</h2>

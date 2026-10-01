@@ -12,9 +12,12 @@ glance:
 3. **What is it costing, and what would the same traffic cost from an API?** your pod's
    wall-clock spend next to a per-provider price sheet, per scope, with the saving.
 
-Plus per-GPU temperature/power/fan straight from host `hwmon`, and a host CPU panel -
-package temperature, clock speed and utilisation as real charts - so a slow decode can be
-told apart from a hot or throttled machine.
+Plus per-GPU temperature/power/fan straight from host `hwmon`, a host CPU panel -
+package temperature, clock speed and utilisation as real charts - and KV-cache panels
+for both tiers: the GPU VRAM KV pool (usage, tokens in cache, prefix-cache hit rate,
+queue) and the CPU offload tier (pinned usage, store/load throughput, and
+"RAM restores" - KV chunks reloaded from RAM instead of rebuilt), so a slow decode can
+be told apart from a hot or throttled machine or a cache that keeps rebuilding.
 
 No build step, no framework, no CDN, no database server, no Python dependencies: one
 stdlib-only `server.py`, four static files, and a JSON config.
@@ -84,6 +87,8 @@ Python 3.9+ is the only requirement.
 | `gpu.sysfs` | `hwmon` root to read GPU stats from, default `/sys/class/drm` |
 | `gpu.label` | display name on the GPU tiles |
 | `cpu.hwmon` / `cpu.sysfs` | `hwmon` root and CPU sysfs root for the CPU tile (load, per-core busy, package temp, clocks) |
+| `kv.gpu_capacity_tokens` | size of the GPU KV pool in tokens (from the vLLM startup log); turns usage % into "tokens in cache". Default 547295 |
+| `kv.ram_capacity_bytes` | size of the CPU KV offload tier in bytes; turns pinned usage % into GB. Default 25760000000 (24 GiB) |
 
 Environment overrides: `TOKENOMICS_CONFIG`, `TOKENOMICS_STATE`, `TOKENOMICS_HISTORY_DB`,
 `TOKENOMICS_HOST`, `TOKENOMICS_PORT`, `TOKENOMICS_BEARER`, `TOKENOMICS_QUIET=1`,

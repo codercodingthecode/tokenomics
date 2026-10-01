@@ -45,5 +45,9 @@
   "cpu": {
     "hwmon": "/sys/class/hwmon",
     "sysfs": "/sys/devices/system/cpu"
+  },
+  "kv": {
+    "gpu_capacity_tokens": 547295,
+    "ram_capacity_bytes": 25760000000
   }
 }

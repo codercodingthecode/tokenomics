@@ -58,9 +58,15 @@ label sets (e.g. `finished_reason`).
 - **vLLM**: `prompt_tokens_total`, `prompt_tokens_cached_total`,
   `generation_tokens_total`, `request_success_total`,
   `spec_decode_num_draft_tokens_total`, `spec_decode_num_accepted_tokens_total`,
-  `num_preemptions_total`, `inter_token_latency_seconds_{sum,count}`,
+  `num_preemptions_total`, `prefix_cache_{hits,queries}_total`,
+  `external_prefix_cache_{hits,queries}_total`,
+  `kv_offload_{store,load}_{bytes,time}_total`, `kv_offload_{store,load}_size_count`,
+  `inter_token_latency_seconds_{sum,count}`,
   `e2e_request_latency_seconds_{sum,count}`; gauges `num_requests_running`,
-  `num_requests_waiting`, `kv_cache_usage_perc`.
+  `num_requests_waiting`, `kv_cache_usage_perc`,
+  `kv_offload_cpu_cache_{,read_,write_}usage_perc`.
+  The offload counters can be absent from the exposition until first use; a missing
+  name parses as 0 and never reads as a reset.
 - **llama.cpp**: `llamacpp:*` names are mapped onto the same internal keys through
   `LLAMA_COUNTER_ALIASES` / `LLAMA_GAUGE_ALIASES`. One semantic fix lives there:
   llama.cpp's prompt counter excludes cached tokens, so the cached total is added back
@@ -77,6 +83,12 @@ downstream.
 - `itl_ms`: `delta(inter_token_latency_sum) / delta(count)`.
 - `accept_rate`: accepted / drafted speculative tokens over the window.
 - `cache_hit_pct`: cached prompt tokens / prompt tokens, per scope.
+- `kv` snapshot block: GPU tier (usage %, tokens = fraction x `kv.gpu_capacity_tokens`,
+  60-s and since-restart prefix hit rate, running/waiting/preemptions) and RAM offload
+  tier (in-flight pinned %/GB, store/load GB/min, since-restart GB + chunks,
+  "RAM restores" = load chunk count, external-prefix tokens + hit rates,
+  avg MB/s = bytes / offload time). Since-restart numbers are `state.last_raw`
+  (the current vLLM lifetime); 60-s rates are deltas off the oldest sample in the window.
 - Provider cost: `uncached x input + cached x cached_input + generated x output`, all
   per 1M tokens, per scope.
 - Pod cost: `(now - scope_start - paused_hours) x hourly_usd`, plus `prior_usd` in the
@@ -86,13 +98,17 @@ downstream.
 
 ## State and restarts
 
-- `state.json`: `baseline`, `last_raw`, `resets`, `session {started_at, totals}`.
+- `state.json`: `baseline`, `last_raw`, `resets`, `last_reset_at`, `session {started_at, totals}`.
   Written atomically (`.tmp` + rename) after every poll. Delete it to count from zero.
+  `last_reset_at` stamps the poll that saw the most recent counter drop; the KV panels
+  label their since-restart numbers with it.
 - Counter reset detection is "any counter decreased". If the server restarts and serves
   more than its previous lifetime before the next poll, the reset is missed; second-scale polling
   makes that vanishingly unlikely.
 - `history.sqlite` (WAL): `samples` (per poll) pruned by `history_ttl_days`, `ledger`
-  (one row per UTC day) never pruned - all-time totals are a feature.
+  (one row per UTC day) never pruned - all-time totals are a feature. `samples` also
+  carries the KV-panel series (`ram_kv`, `kv_{store,load}_gbps`, `kv_{store,load}_bytes`
+  and the `px_`/`ext_` cumulative counters); columns are added by ALTER, NULL-safe.
 
 ## Host health
 
@@ -132,6 +148,10 @@ CLIs, no `rocm-smi`/`nvidia-smi` shelling out.
 - Themes: `dark` is the default, then `light`, then `amber`; the header button cycles and
   persists to `localStorage`, and `?theme=` wins. Only chrome changes between themes -
   data series keep the same hues, so a screenshot means the same thing.
+- KV panels: one card, two panes (GPU VRAM tier, RAM offload tier). Each pane has a
+  meter, since-restart stats, and a chart of usage % with the store/load GB-min transfer
+  rates as second series (dashed grey = store, green = load). The card hides itself
+  when the source exposes no KV metrics (llama.cpp, older vLLM).
 - `.flashy` / `.flash` give a one-shot background flash so live movement is visible.
 - The page auto-reloads when `ui_version` changes so an open tab never runs stale
   assets after a deploy.
