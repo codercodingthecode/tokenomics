@@ -86,7 +86,9 @@
     const series = [];
     for (const h of (hist || [])) {
       const g = (h.gpus || []).find(x => x.index === idx);
-      if (g && g.edge_c != null) series.push({ t: h.t, v: g.edge_c });
+      if (!g) continue;
+      const v = g.junction_c != null ? g.junction_c : g.edge_c;
+      if (v != null) series.push({ t: h.t, v });
     }
     if (series.length < 2) return "";
     const W = 200, H = 40, padT = 4, padB = 4;
@@ -103,14 +105,15 @@
       `<circle cx="${x(last.t).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="2" fill="${col}"/>`;
   }
   function gpuCard(g, hist) {
-    const tc = tempClass(g.edge_c);
-    const st = gpuState(g.edge_c);
-    const crit = g.edge_crit_c || 110;
-    const tw = g.edge_c != null ? Math.min(100, 100 * g.edge_c / crit) : 0;
+    const jc = g.junction_c != null ? g.junction_c : g.edge_c;
+    const tc = tempClass(jc);
+    const st = gpuState(jc);
+    const crit = g.junction_crit_c || g.edge_crit_c || 110;
+    const tw = jc != null ? Math.min(100, 100 * jc / crit) : 0;
     const pmax = g.power_cap_max_w || 300;
     const pw = g.power_w != null ? Math.min(100, 100 * g.power_w / pmax) : 0;
     const capw = (g.power_cap_w != null && pmax) ? Math.min(100, 100 * g.power_cap_w / pmax) : null;
-    const junction = g.junction_c != null ? Math.round(g.junction_c) + "\u00b0" : "\u2013";
+    const edge = g.edge_c != null ? Math.round(g.edge_c) + "\u00b0" : "\u2013";
     const mem = g.mem_c != null ? Math.round(g.mem_c) + "\u00b0" : "\u2013";
     const cap = g.power_cap_w != null ? Math.round(g.power_cap_w) + "W" : "\u2013";
     const freq = g.freq_ghz != null ? g.freq_ghz.toFixed(2) + "GHz" : "\u2013";
@@ -119,10 +122,10 @@
       <div class="gpu-head"><span class="gpu-name">GPU ${g.index}</span><span class="gpu-state ${st[0]}">${st[1]}</span></div>
       <div class="gpu-metrics">
         <div class="gpu-metric">
-          <div class="gpu-metric-label">edge temp</div>
-          <div class="gpu-metric-val ${tc}">${g.edge_c != null ? g.edge_c.toFixed(1) : "\u2013"}<small>\u00b0C</small></div>
+          <div class="gpu-metric-label">junction temp</div>
+          <div class="gpu-metric-val ${tc}">${jc != null ? jc.toFixed(1) : "\u2013"}<small>\u00b0C</small></div>
           <div class="gbar"><div class="gbar-fill ${tc}" style="width:${tw.toFixed(1)}%"></div></div>
-          <div class="gpu-metric-sub">junction <b>${junction}</b> \u00b7 mem <b>${mem}</b></div>
+          <div class="gpu-metric-sub">edge <b>${edge}</b> \u00b7 mem <b>${mem}</b></div>
         </div>
         <div class="gpu-metric">
           <div class="gpu-metric-label">power</div>
@@ -131,7 +134,7 @@
           <div class="gpu-metric-sub">cap <b>${cap}</b> \u00b7 <b>${freq}</b> \u00b7 <b>${fan}</b></div>
         </div>
       </div>
-      <div class="gpu-spark-wrap"><div class="gpu-spark-label">edge temp \u00b7 last 15 min</div>
+      <div class="gpu-spark-wrap"><div class="gpu-spark-label">junction temp \u00b7 last 15 min</div>
         <svg class="gpu-spark" viewBox="0 0 200 40" preserveAspectRatio="none">${gpuSpark(g.index, hist)}</svg></div>
     </div>`;
   }
@@ -139,7 +142,7 @@
     const gpus = s.gpus || [];
     const grid = $("gpuGrid"), sub = $("gpuSub");
     if (!gpus.length) { sub.textContent = "no GPU data (running off-box?)"; grid.innerHTML = ""; return; }
-    sub.textContent = s.gpu_label || (gpus.length + "\u00d7 amdgpu \u00b7 edge/junction/mem \u00b7 PPT power");
+    sub.textContent = s.gpu_label || (gpus.length + "\u00d7 amdgpu \u00b7 junction/edge/mem \u00b7 PPT power");
     grid.innerHTML = gpus.map(g => gpuCard(g, s.gpu_history || [])).join("");
   }
 
@@ -331,7 +334,7 @@
       ["fastest core", fmtGhz(row.cpu_ghz)],
       ["busy", fmtPct(row.cpu_pct)],
       ["load 1m", row.load1 == null ? null : v1(row.load1)],
-      ["gpu edge", fmtDeg(row.gpu_c)],
+      ["gpu junc", fmtDeg(row.gpu_c)],
     ]),
     emptyHtml: "no cpu temperature sensor",
   });

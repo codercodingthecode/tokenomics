@@ -261,6 +261,7 @@ def read_gpus(sysfs_root):
             "junction_c": rd("temp2_input", 1e-3),
             "mem_c": rd("temp3_input", 1e-3),
             "edge_crit_c": rd("temp1_crit", 1e-3),
+            "junction_crit_c": rd("temp2_crit", 1e-3),
             "power_w": rd("power1_average", 1e-6),
             "power_cap_w": rd("power1_cap", 1e-6),
             "power_cap_max_w": rd("power1_cap_max", 1e-6),
@@ -717,7 +718,8 @@ class Poller(threading.Thread):
                                   "requests": totals["request_success_total"],
                                   "cpu_c": cpu.get("tctl_c"), "cpu_ghz": cpu.get("ghz_max"),
                                   "cpu_pct": cpu.get("pct"), "load1": cpu.get("load1"),
-                                  "gpu_c": max([g["edge_c"] for g in gpus if g.get("edge_c") is not None] or [None])},
+                                  "gpu_c": max([(g.get("junction_c") if g.get("junction_c") is not None else g.get("edge_c")) for g in gpus
+                                   if g.get("junction_c") is not None or g.get("edge_c") is not None] or [None])},
                                  pod_usd=(snap.get("pod") or {}).get("usd"))
                 snap["history"] = self.history.rows(ts - self.cfg.history_minutes * 60, ts)
                 self.snapshot = snap

@@ -98,7 +98,9 @@ downstream.
 
 `read_gpus()` walks `/sys/class/drm/card*/device/hwmon/hwmon*` for amdgpu
 (edge/junction/memory temperature, power draw, cap, fan, clock) and keeps a
-180-sample ring buffer for sparklines. `read_cpu()` uses `/proc/stat`, `/proc/loadavg`,
+180-sample ring buffer for sparklines. The GPU card surfaces junction temp as
+the primary number (edge + mem are secondary); the `gpu_c` history sample is
+the hottest junction across all GPUs. `read_cpu()` uses `/proc/stat`, `/proc/loadavg`,
 `hwmon` (`k10temp`/`zenpower`) and `cpufreq`. Both return empty when the paths are
 absent, so running the dashboard off-box degrades quietly. Keep it this way: no vendor
 CLIs, no `rocm-smi`/`nvidia-smi` shelling out.
