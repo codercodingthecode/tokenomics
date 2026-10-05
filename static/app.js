@@ -1117,7 +1117,7 @@
       const g = el("div", "grid");
       g.style.top = (100 - 100 * v / hi).toFixed(2) + "%";
       chart.appendChild(g);
-      const gl = el("span", "glab", "$" + v);
+      const gl = el("span", "glab", v >= 1000 ? "$" + (v / 1000) + "K" : "$" + v);
       gl.style.top = (100 - 100 * v / hi).toFixed(2) + "%";
       chart.appendChild(gl);
     }
