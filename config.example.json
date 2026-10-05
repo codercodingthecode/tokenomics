@@ -46,6 +46,9 @@
     "hwmon": "/sys/class/hwmon",
     "sysfs": "/sys/devices/system/cpu"
   },
+  "gateway": {
+    "url": "http://127.0.0.1:8081/__gw_live"
+  },
   "kv": {
     "gpu_capacity_tokens": 547295,
     "ram_capacity_bytes": 25760000000

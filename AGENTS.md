@@ -10,8 +10,10 @@ about how the code is put together, the constraints that are non-negotiable, and
    No pip installs, no venv, no requirements.txt. That is the whole point: it has to run
    on a machine with no package index.
 2. **No frontend build.** `static/index.html` + `static/styles.css` + `static/app.js` +
-   `static/charts.js`, vanilla JS, hand-drawn SVG (one small shared chart engine, no
-   charting library). No framework, no bundler, no CDN, no webfonts.
+   `static/charts.js`, vanilla JS, hand-drawn SVG (one shared chart engine, no
+   charting library). No framework, no bundler, no CDN, no webfonts **from a CDN** —
+   the two typefaces (Instrument Sans, Azeret Mono) are vendored variable woff2 files
+   in `static/fonts/` and served by `server.py` like any other static file.
 3. **Single file server.** Everything server-side stays in `server.py`. If it grows past
    a point where modules are unavoidable, propose that first.
 4. **Nothing personal, nothing private, nothing vendor-specific in this repo.** No
@@ -20,17 +22,21 @@ about how the code is put together, the constraints that are non-negotiable, and
    (gitignored). Deployment docs stay generic (`your-host`, `/opt/tokenomics`, port
    `8787`). Examples in `config.example.json` must be obviously fake.
 5. **Backwards-compatible state.** `state.json` and `history.sqlite` hold long-lived
-   totals. A schema change must read the old shape without migrating it into garbage.
+   totals. A schema change must read the old shape without migrating it into garbage:
+   new `state.json` keys default to empty, new `samples` columns are added by ALTER and
+   inserted by explicit column list (old databases gain columns at the end), old
+   sessions without `finish` simply carry no reason split.
 
 ## Files
 
 | file | role |
 |---|---|
-| `server.py` | config, restart-safe state, poller thread, costs, hwmon readers, HTTP handler, SSE |
+| `server.py` | config, restart-safe state, poller thread, costs, latency percentiles, gateway proxy, hwmon readers, HTTP handler, SSE |
 | `static/index.html` | markup |
 | `static/styles.css` | all styling; theming through CSS custom properties |
-| `static/charts.js` | `window.TokCharts` - the dependency-free SVG chart engine (line/area, monotone interpolation, gaps, bands, refs, end-value pills, crosshair) |
-| `static/app.js` | SSE client, render loop, scope toggle, chart instances, theme toggle |
+| `static/charts.js` | `window.TokCharts` - the dependency-free SVG chart engine (line/area, monotone interpolation, gaps, bands, refs, end pills, crosshair) plus `paths()`/`barsPath()` raw path builders the hand-built section SVGs reuse |
+| `static/app.js` | SSE client, render loop, gateway observer panel (1 s poll), scope toggle, range control, theme toggle |
+| `static/fonts/` | vendored variable woff2: Instrument Sans (text) + Azeret Mono (numbers), latin + latin-ext |
 | `config.example.json` | documented template; copy to `config.json` |
 | `Dockerfile`, `tokenomics.service` | the two supported deploys |
 
@@ -40,12 +46,19 @@ about how the code is put together, the constraints that are non-negotiable, and
 
 ```
 metrics URL --(GET every poll_interval_seconds, optional Bearer)--> Poller thread
-  parse_metrics()      regex-parse the exposition format, sum across label sets
+  parse_metrics()      regex-parse the exposition format, sum counters/gauges across
+                       label sets; keep _bucket histograms per le and the
+                       per-finished_reason split of request_success_total
   State.absorb()       counter went down? fold the previous raw values into `baseline`
+                       (the reason split gets the same treatment)
   State.ensure_session() first poll of a deployment snapshots the session baseline
   compute()            rates from deltas, per-scope views, provider + pod costs
+  History.add()        per-poll sample (incl. the `preempt` counter) + one hist_snap row
   broadcast()          one JSON snapshot per poll to every SSE queue
 browser <--(GET /events; ": keepalive" every 15 s)
+browser --(GET /api/gw_live every 1 s)--> server proxies the gateway observer (2 s
+  timeout, body passed through, Cache-Control: no-store; 404 when unconfigured,
+  502 with {"ok": false, "error": ...} when unreachable)
 ```
 
 `GET /api/stats` returns the same snapshot for poll-only clients.
@@ -67,6 +80,17 @@ label sets (e.g. `finished_reason`).
   `kv_offload_cpu_cache_{,read_,write_}usage_perc`.
   The offload counters can be absent from the exposition until first use; a missing
   name parses as 0 and never reads as a reset.
+- **Histograms** (`HIST_BASES`): `vllm:time_to_first_token_seconds_bucket`,
+  `vllm:request_queue_time_seconds_bucket`, `vllm:e2e_request_latency_seconds_bucket`.
+  These are NOT summed over label sets — each `le` is kept as its own series in a
+  `hist_snap` row per poll (JSON maps, pruned with the sample TTL). Percentiles are
+  computed from bucket **deltas** between the two snapshots bracketing the client's
+  chart window, interpolating linearly inside the crossing bucket; when the window
+  cannot be bracketed the current vLLM lifetime (`hist_raw`) is the fallback.
+- **Finish reasons**: the per-`finished_reason` split of `request_success_total`
+  (stop / length / abort / ...) is tracked in `State.reason_{baseline,last_raw}` —
+  the same restart-safe accounting as the main counters — and surfaced in both
+  scopes' totals as `totals.finish`. llama.cpp never labels it, so it is simply `{}`.
 - **llama.cpp**: `llamacpp:*` names are mapped onto the same internal keys through
   `LLAMA_COUNTER_ALIASES` / `LLAMA_GAUGE_ALIASES`. One semantic fix lives there:
   llama.cpp's prompt counter excludes cached tokens, so the cached total is added back
@@ -83,6 +107,11 @@ downstream.
 - `itl_ms`: `delta(inter_token_latency_sum) / delta(count)`.
 - `accept_rate`: accepted / drafted speculative tokens over the window.
 - `cache_hit_pct`: cached prompt tokens / prompt tokens, per scope.
+- `req_per_min`: `delta60("requests")` — requests now minus the oldest sample in the
+  last 60 s.
+- `lat` block: `ttft_p50`, `ttft_p90`, `queue_p90`, `e2e_p90` per the window described
+  above. The snapshot carries it for the default window; `frame(minutes)` recomputes it
+  for other chart ranges, so the header range control drives these too.
 - `kv` snapshot block: GPU tier (usage %, tokens = fraction x `kv.gpu_capacity_tokens`,
   60-s and since-restart prefix hit rate, running/waiting/preemptions) and RAM offload
   tier (in-flight pinned %/GB, store/load GB/min, since-restart GB + chunks,
@@ -95,64 +124,108 @@ downstream.
   total scope only. Wall-clock, deliberately not token-based.
 - `x_pod`: provider cost / pod cost, `null` below $0.01 so a freshly started window does
   not print an absurd multiplier.
+- Daily ledger (`/api/ledger`): per-UTC-day **deltas** of the cumulative `ledger` rows,
+  plus the hero provider's cost for the day's tokens and the pod's cost for the day,
+  all computed **server-side** (AGENTS.md rule: no cost math in JS). The client renders
+  it: bars (weekends dimmed), the pod's flat `$hourly x 24` line, day labels.
 
 ## State and restarts
 
-- `state.json`: `baseline`, `last_raw`, `resets`, `last_reset_at`, `session {started_at, totals}`.
+- `state.json`: `baseline`, `last_raw`, `resets`, `last_reset_at`, `session
+  {started_at, totals, finish}`, `reason_baseline`, `reason_last_raw`.
   Written atomically (`.tmp` + rename) after every poll. Delete it to count from zero.
   `last_reset_at` stamps the poll that saw the most recent counter drop; the KV panels
   label their since-restart numbers with it.
 - Counter reset detection is "any counter decreased". If the server restarts and serves
-  more than its previous lifetime before the next poll, the reset is missed; second-scale polling
-  makes that vanishingly unlikely.
-- `history.sqlite` (WAL): `samples` (per poll) pruned by `history_ttl_days`, `ledger`
-  (one row per UTC day) never pruned - all-time totals are a feature. `samples` also
-  carries the KV-panel series (`ram_kv`, `kv_{store,load}_gbps`, `kv_{store,load}_bytes`
-  and the `px_`/`ext_` cumulative counters); columns are added by ALTER, NULL-safe.
+  more than its previous lifetime before the next poll, the reset is missed; second-scale
+  polling makes that vanishingly unlikely.
+- The poll that absorbs a restart reports its rates as 0/`null`: the fold puts the whole
+  new lifetime into the cumulative totals, so that window's counter delta is the entire
+  lifetime, not this poll's seconds — without the guard the chart gets one 30,000 tok/s
+  sample and `req/min` spikes. `samples.reset` (1 on that poll, ALTER-added) tells the
+  UI to skip reset-adjacent deltas in the preemption event detector.
+- `history.sqlite` (WAL): `samples` (per poll, incl. `preempt` = the raw
+  `num_preemptions_total` the UI uses to spot preemption events, and `reset` = the
+  restart-absorbing poll, see above) pruned by
+  `history_ttl_days`; `hist_snap` (per-poll raw histogram buckets, pruned with the
+  samples); `ledger` (one row per UTC day) never pruned — all-time totals are a
+  feature. Columns are added by ALTER, NULL-safe, and inserted by explicit column
+  list so old databases with appended columns cannot misalign.
+
+## Gateway observer (Live requests panel)
+
+- `GET /api/gw_live` proxies `gateway.url` (config; env override
+  `TOKENOMICS_GATEWAY_URL`). Unconfigured → `404`, the page hides the section.
+  Unreachable → `502 {"ok": false, "error": ...}`, the page keeps the last snapshot,
+  shows the STALE pill and dims the tables.
+- The gateway's contract: `{ time, origin, in_flight: [req…] (oldest first),
+  recent: [req…] (last 30 finished, newest first) }` with identity
+  (`id`, `thread`, `client`, `model`, `effort`), progress (`phase`, `tool_name`,
+  `started_at`, `age_s`, `ttft_s`), token counts (`prompt_tokens` +
+  `prompt_tokens_is_estimate`, `cached_tokens`, `output_tokens` +
+  `output_tokens_is_estimate`, `tok_s`), streamed text (`reasoning_chars`,
+  `output_chars`, `tool_chars`, `tail`), context (`input_items`, `tools`,
+  `last_input_type`) and outcome (`finish`, `error`, `events`).
+- **Everything from the gateway is untrusted data.** `app.js` builds the panel with
+  `createElement`/`textContent` only — never `innerHTML` with gateway strings, never
+  execute anything from `tail`.
+- The client keeps a `Map<id, number[60]>` of `tok_s` per request (one entry per
+  1 s poll, null before the first token, capped at 60, ids pruned when the request
+  leaves `in_flight`) for the shared-scale sparklines, and one open tail id.
 
 ## Host health
 
 `read_gpus()` walks `/sys/class/drm/card*/device/hwmon/hwmon*` for amdgpu
-(edge/junction/memory temperature, power draw, cap, fan, clock) and keeps a
-15-minute ring buffer for sparklines (scaled to the poll interval). The sparkline
-draws all three temps: junction as the primary heat-colored line, edge and mem as
-thinner fixed-color lines with a legend. The GPU card surfaces junction temp as
-the primary number (edge + mem are secondary); the `gpu_c` history sample is
-the hottest junction across all GPUs. `read_cpu()` uses `/proc/stat`, `/proc/loadavg`,
-`hwmon` (`k10temp`/`zenpower`) and `cpufreq`. Both return empty when the paths are
-absent, so running the dashboard off-box degrades quietly. Keep it this way: no vendor
-CLIs, no `rocm-smi`/`nvidia-smi` shelling out.
+(edge/junction/memory temperature, power draw, cap, fan, clock) and
+`card*/device/` for `gpu_busy_percent` + `mem_info_vram_{used,total}`
+(`None` when the kernel does not expose them); it keeps a 15-minute ring buffer for
+the per-GPU min/max ranges. The hardware column shows each GPU and the CPU on a shared
+0-110 °C scale (zone strip, 15-min min-max range, now marker) with power/cap,
+VRAM, clocks, per-thread utilisation (`cpu.pct_cores`) and a footnote. `read_cpu()`
+uses `/proc/stat`, `/proc/loadavg`, `hwmon` (`k10temp`/`zenpower`) and `cpufreq`.
+Both return empty when the paths are absent, so running the dashboard off-box degrades
+quietly. Keep it this way: no vendor CLIs, no `rocm-smi`/`nvidia-smi` shelling out.
 
 ## UI conventions
 
-- Economics first: the hero is the saving against `hero_provider`; raw counters are
-  secondary chips.
+- One page, four sections top to bottom, each a plain block separated by
+  `border-bottom: 1px solid var(--border)` on the page background. **No cards**: no
+  card borders, no backgrounds, no shadows (the only shadow in the design is the mark's
+  inset highlight). Full width, `main { padding: 0 40px }`, one ambient glow at the top
+  (no grid pattern).
+- Economics still first overall: section 4's hero is the saving against
+  `hero_provider`; the pipeline (section 1) leads with what the server is doing now.
 - Two series colors only - blue for API providers, orange for the pod, validated for
-  colorblind separation in every theme. Green means savings/positive. Add rows rather
-  than new hues. Host sensors use their own fixed semantic ramp
-  (`--t-ok`/`--t-warm`/`--t-hot`/`--t-crit` for temperature, `--power` for clocks,
-  `--series-pod` for load); a temp line takes the color of its newest sample.
-- Numbers in `ui-monospace` with `tabular-nums`, compact form primary (46.0M) with exact
-  values in tooltips. Text never wears a series color.
-- Both scopes ride in every snapshot, so the Total/Session toggle is a pure client
-  switch.
-- Charts go through `TokCharts.makeChart(cfg)` rather than new SVG strings per chart.
-  `null` is a break in the line, never a straight join; `bands` stay out of the y-domain
-  and `refs` stay in it; `zeroBase` defaults to true and is off for temperature. The
-  throughput chart and the three CPU panes share an x domain, so `linkCharts()` sweeps
-  one crosshair across all four. Colors are emitted as `var(--token)` - pass a CSS
-  variable name, never a raw color, and add new files to `STATIC_FILES` in `server.py`
-  or they will not be served.
-- Ranges come from SQLite: 15 min/1 h read the snapshot buffer, 6 h/24 h/7 d refetch,
-  and both copies of the range control stay in sync.
-- Themes: `dark` is the default, then `light`, then `amber`; the header button cycles and
-  persists to `localStorage`, and `?theme=` wins. Only chrome changes between themes -
-  data series keep the same hues, so a screenshot means the same thing.
-- KV panels: one card, two panes (GPU VRAM tier, RAM offload tier). Each pane has a
-  meter, since-restart stats, and a chart of usage % with the store/load GB-min transfer
-  rates as second series (dashed grey = store, green = load). The card hides itself
-  when the source exposes no KV metrics (llama.cpp, older vLLM).
-- `.flashy` / `.flash` give a one-shot background flash so live movement is visible.
+  colorblind separation in every theme. Green means savings/positive. Host sensors use
+  their own fixed semantic ramp (`--t-ok`/`--t-warm`/`--t-hot`/`--t-crit`, `--power`,
+  `--gpu-mem`); a temp value takes the color of its state. Phase badges in the gateway
+  panel reuse existing tokens (queued `--warn`, prefill `--text-2`, thinking
+  `--gpu-mem`, answering `--line`, tool call `--power`, done `--good`, error `--bad`).
+  Add rows rather than new hues.
+- Numbers in `var(--mono)` (Azeret Mono) with `tabular-nums`, compact form primary
+  (46.0M) with exact values in tooltips. Text never wears a series color.
+- Both scopes ride in every snapshot, so the All time / This deployment toggle is a pure
+  client switch. The header range control is the only range control on the page and
+  drives the main chart, the pipeline mini charts, the KV chart and the hardware
+  min-max ranges by re-subscribing the SSE with `?minutes=`.
+- Charts: the engine (`TokCharts.makeChart`) still exists but the redesigned page
+  hand-builds its SVGs through `TokCharts.paths()` / `barsPath()` (same monotone +
+  gap rules, `vector-effect: non-scaling-stroke`). `null` is a break in the line, never
+  a straight join. Colors are emitted as `var(--token)` — pass a CSS variable name,
+  never a raw color, and add new files to `STATIC_FILES` in `server.py` or they will
+  not be served.
+- Ranges come from SQLite: 15 min/1 h ride the snapshot buffer, 6 h/24 h/7 d refetch.
+- Themes: `dark` is the default, then `light`, then `amber`; the header button cycles
+  and persists to `localStorage`, and `?theme=` wins. Only chrome changes between
+  themes - data series keep the same hues, so a screenshot means the same thing.
+- Gateway panel: in-flight table (150/244/92/92/100/92/66/1fr/92 grid) with a 60-poll
+  tok/s sparkline on a shared 0-40 scale; below it the "Just finished" table (last 30,
+  10 shown). "Waiting for GPU" = `prefill` + no first token + `age_s > 15`.
+  "tail is repeating" = a client-side heuristic (any 40-char substring of `tail`,
+  stepping 10, seen 3+ times) shown on `thinking` rows. One tail open at a time;
+  the open id survives polls and closes itself when the request leaves `in_flight`.
+- `.flashy` / `.flash` give a one-shot background flash so live movement is visible
+  (pipeline big numbers, savings hero).
 - The page auto-reloads when `ui_version` changes so an open tab never runs stale
   assets after a deploy.
 
@@ -164,23 +237,27 @@ python3 server.py --port 8787
 curl -s localhost:8787/healthz
 curl -s localhost:8787/api/stats | head -c 400
 curl -sN localhost:8787/events | head -c 300
+curl -s localhost:8787/api/gw_live    # 404 without gateway.url, 502 when it is down
 ```
 
 There is no test suite; the check is: it starts with a real metrics endpoint, `/healthz`
-is `ok`, `/api/stats` carries `totals`, `session`, `costs`, `gpus`, `cpu`, and the page
-renders in all three themes with and without GPU data and with and without host CPU
-sensors. Keep `python3 -c "import ast,sys;ast.parse(open('server.py').read())"`
+is `ok`, `/api/stats` carries `totals`, `session`, `costs`, `gpus`, `cpu`, `lat`, and the
+page renders in all three themes with and without GPU data, host CPU sensors, KV metrics
+(llama.cpp) and a configured gateway (no gateway = section 2 hidden; gateway down =
+stale pill). Keep `python3 -c "import ast,sys;ast.parse(open('server.py').read())"`
 green, and keep the file importable with no side effects until `main()` runs.
 
 ## Extending it
 
-- **New number**: parse into `COUNTERS`/`GAUGES`, derive it in `compute()`, add it to the
-  snapshot, render it. Do not compute costs in JS.
+- **New number**: parse into `COUNTERS`/`GAUGES` (or a `HIST_BASES` entry), derive it
+  in `compute()`, add it to the snapshot, render it. Do not compute costs in JS.
 - **Second endpoint**: `source` would become a list plus a UI selector; keep one
   `state.json` per source so totals cannot cross-contaminate.
 - **Container control** (`DockerControl`) is opt-in via `TOKENOMICS_VLLM_CONTROL=1`
   because it reaches the Docker socket. Anything new in that direction needs the same
   treatment: default off, documented, and never implied by the presence of a socket.
+  The gateway proxy is the opposite shape — it is always on when configured because
+  it only ever GETs one URL on the same host.
 
 ## Pull requests
 

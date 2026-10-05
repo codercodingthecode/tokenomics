@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""tokenomics — live token / throughput / cost dashboard for a vLLM endpoint.
+"""tokenomics \u2014 live token / throughput / cost dashboard for a vLLM endpoint.
 
 Stdlib only (Python 3.9+). Polls vLLM's Prometheus /metrics, accumulates counters
 across vLLM restarts, prices the traffic against API providers, and pushes updates
-to the browser over Server-Sent Events.
+to the browser over Server-Sent Events. Also proxies the LLM gateway's live-request
+observer (/api/gw_live -> the gateway's /__gw_live) so the browser stays same-origin.
 
     python3 server.py [--config config.json] [--port 8787] [--host 0.0.0.0]
 
 The snapshot exposes two scopes:
-  total   — everything counted since counting began (baseline + current, restart-safe)
-  session — this deployment's window: counters since the server's first poll
+  total   \u2014 everything counted since counting began (baseline + current, restart-safe)
+  session \u2014 this deployment's window: counters since the server's first poll
             (persisted in state.json, survives server restarts)
 """
 import argparse
@@ -80,11 +81,26 @@ LLAMA_GAUGE_ALIASES = {
 }
 LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 
+# Prometheus histograms the dashboard turns into percentiles. parse_metrics() keeps the
+# _bucket series per le (they are NOT summed over label sets); the client-facing
+# percentiles are computed from bucket deltas over the chart window (or, as a fallback,
+# over the current vLLM lifetime), interpolating linearly inside a bucket.
+HIST_BASES = {
+    "time_to_first_token_seconds": "ttft",
+    "request_queue_time_seconds": "queue",
+    "e2e_request_latency_seconds": "e2e",
+}
+
 STATIC_FILES = {
     "index.html": "text/html; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
     "charts.js": "text/javascript; charset=utf-8",
+    # vendored variable fonts (no CDN): Instrument Sans for text, Azeret Mono for numbers
+    "fonts/instrument-sans.woff2": "font/woff2",
+    "fonts/instrument-sans-latin-ext.woff2": "font/woff2",
+    "fonts/azeret-mono.woff2": "font/woff2",
+    "fonts/azeret-mono-latin-ext.woff2": "font/woff2",
 }
 # changes whenever a static file changes; the page reloads itself when it sees a new value
 UI_VERSION = str(int(max(os.path.getmtime(os.path.join(HERE, "static", n)) for n in STATIC_FILES)))
@@ -104,6 +120,42 @@ def parse_iso(s):
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s).timestamp()
+
+
+def hist_quantile(buckets, q):
+    """q-quantile of a Prometheus histogram {le: count} (already delta'd) in seconds.
+
+    Linear interpolation inside the bucket that crosses the quantile; +Inf carries the
+    overflow. Returns None when the delta is empty."""
+    if not buckets:
+        return None
+    ordered = []
+    total = None
+    for le, c in buckets.items():
+        try:
+            lev, cv = float(le), float(c)
+        except (TypeError, ValueError):
+            continue
+        ordered.append((lev, cv))
+        if lev == float("inf"):
+            # the +Inf bucket is the histogram total itself, not an extra count
+            total = cv
+    if total is None:
+        total = sum(c for _, c in ordered)
+    if total <= 0:
+        return None
+    target = q * total
+    ordered.sort()
+    cum = 0.0
+    prev = 0.0
+    for lev, c in ordered:
+        if lev == float("inf"):
+            continue
+        if c > 0 and cum + c >= target:
+            return prev + (target - cum) / c * (lev - prev)
+        cum += c
+        prev = lev
+    return prev  # all of the mass sits in the +Inf bucket
 
 
 class Config:
@@ -140,6 +192,9 @@ class Config:
         # KV tier capacities: turn usage fractions into tokens (VRAM) and GB (RAM offload tier)
         self.kv_gpu_capacity = float(kv.get("gpu_capacity_tokens", 547295))
         self.kv_ram_capacity = float(kv.get("ram_capacity_bytes", 25760000000))
+        # LLM gateway observer: the /api/gw_live proxy target. Unset -> the route 404s and
+        # the page hides the Live requests section.
+        self.gateway_url = os.environ.get("TOKENOMICS_GATEWAY_URL") or (self.raw.get("gateway") or {}).get("url")
         self.state_path = os.environ.get("TOKENOMICS_STATE") or os.path.join(HERE, self.raw.get("state_file", "state.json"))
         os.makedirs(os.path.dirname(os.path.abspath(self.state_path)), exist_ok=True)
         # per-poll samples live in SQLite next to state.json unless overridden
@@ -166,7 +221,11 @@ class State:
         self.resets = 0
         self.last_reset_at = None
         self.extra_requests = 0.0   # synthetic request counter for llama.cpp (0->N running transitions)
-        self.session = None  # {"started_at": ts, "totals": {counter: value}} — this deployment's window
+        # per finished_reason split of request_success_total (stop / length / abort / ...);
+        # same baseline + last_raw accounting as the main counters, so it is restart-safe
+        self.reason_baseline = {}
+        self.reason_last_raw = {}
+        self.session = None  # {"started_at": ts, "totals": {counter: value}, "finish": {reason: value}}
         self.load()
 
     def load(self):
@@ -179,6 +238,8 @@ class State:
             self.resets = d.get("resets", 0)
             self.last_reset_at = d.get("last_reset_at")
             self.extra_requests = float(d.get("extra_requests", 0.0))
+            self.reason_baseline = {k: float(v) for k, v in (d.get("reason_baseline") or {}).items()}
+            self.reason_last_raw = {k: float(v) for k, v in (d.get("reason_last_raw") or {}).items()}
             s = d.get("session")
             if isinstance(s, dict) and s.get("started_at") and isinstance(s.get("totals"), dict):
                 self.session = s
@@ -191,11 +252,16 @@ class State:
             json.dump({"baseline": self.baseline, "last_raw": self.last_raw,
                        "first_seen": self.first_seen, "resets": self.resets,
                        "last_reset_at": self.last_reset_at,
-                       "extra_requests": self.extra_requests, "session": self.session}, f, indent=1)
+                       "extra_requests": self.extra_requests,
+                       "reason_baseline": self.reason_baseline, "reason_last_raw": self.reason_last_raw,
+                       "session": self.session}, f, indent=1)
         os.replace(tmp, self.path)
 
-    def absorb(self, raw):
-        """Fold a fresh raw counter snapshot in; detect resets; return cumulative totals."""
+    def absorb(self, raw, reasons=None):
+        """Fold a fresh raw counter snapshot in; detect resets; return cumulative totals.
+
+        totals also carries "finish": the cumulative per-reason split ({} when the source
+        never labels request_success_total, e.g. llama.cpp)."""
         reset = False
         for k in COUNTERS:
             v = raw.get(k, 0.0)
@@ -205,26 +271,43 @@ class State:
         if reset:
             for k in COUNTERS:
                 self.baseline[k] += self.last_raw.get(k, 0.0)
+            for r, v in self.reason_last_raw.items():
+                self.reason_baseline[r] = self.reason_baseline.get(r, 0.0) + v
             self.resets += 1
             self.last_reset_at = now_ts()
         for k in COUNTERS:
             self.last_raw[k] = raw.get(k, 0.0)
+        if reasons is not None:
+            for r, v in reasons.items():
+                self.reason_last_raw[r] = float(v)
         if self.first_seen is None:
             self.first_seen = now_ts()
         self.save()
-        return {k: self.baseline[k] + self.last_raw[k] for k in COUNTERS}
+        totals = {k: self.baseline[k] + self.last_raw[k] for k in COUNTERS}
+        known = set(self.reason_baseline) | set(self.reason_last_raw)
+        totals["finish"] = {r: self.reason_baseline.get(r, 0.0) + self.reason_last_raw.get(r, 0.0)
+                            for r in known}
+        return totals, reset
 
     def ensure_session(self, ts, totals):
         """First successful poll starts the session window; persisted across server restarts."""
         if self.session is None:
-            self.session = {"started_at": ts, "totals": dict(totals)}
+            self.session = {"started_at": ts, "totals": dict(totals),
+                            "finish": dict(totals.get("finish") or {})}
             self.save()
         return self.session
 
 
 def parse_metrics(text):
+    """Exposition format -> (counters, gauges, model, is_llama, reasons, hists).
+
+    counters/gauges are summed over label sets; reasons is the per-finished_reason split of
+    request_success_total; hists is {ttft|queue|e2e: {le: count}} keeping every bucket
+    separate (percentiles come from deltas, so bucket values must not be mixed)."""
     counters = {k: 0.0 for k in COUNTERS}
     gauges = {k: 0.0 for k in GAUGES}
+    reasons = {}
+    hists = {"ttft": {}, "queue": {}, "e2e": {}}
     model = None
     is_llama = False
     for line in text.splitlines():
@@ -243,8 +326,19 @@ def parse_metrics(text):
             elif name in LLAMA_GAUGE_ALIASES:
                 gauges[LLAMA_GAUGE_ALIASES[name]] += v
             continue
-        if name in counters:
+        if name.endswith("_bucket"):
+            base = name[: -len("_bucket")]
+            key = HIST_BASES.get(base)
+            if key is not None:
+                le = dict(LABEL_RE.findall(labels)).get("le")
+                if le is not None:
+                    hists[key][le] = hists[key].get(le, 0.0) + v
+        elif name in counters:
             counters[name] += v  # sum over label sets (e.g. finished_reason)
+            if name == "request_success_total":
+                fr = dict(LABEL_RE.findall(labels)).get("finished_reason")
+                if fr:
+                    reasons[fr] = reasons.get(fr, 0.0) + v
         elif name in gauges:
             gauges[name] += v
         if model is None and 'model_name="' in labels:
@@ -252,12 +346,12 @@ def parse_metrics(text):
     if is_llama:
         # llama.cpp's prompt_tokens_total EXCLUDES cached; vLLM semantics include it
         counters["prompt_tokens_total"] += counters["prompt_tokens_cached_total"]
-    return counters, gauges, model, is_llama
-
+    return counters, gauges, model, is_llama, reasons, hists
 
 
 def read_gpus(sysfs_root):
-    """Per-GPU temp/power/fan/freq from host amdgpu hwmon (bind-mounted read-only).
+    """Per-GPU temp/power/fan/freq from host amdgpu hwmon (bind-mounted read-only), plus
+    utilisation + VRAM from card*/device when the kernel exposes them.
     Returns [] when the sysfs path is absent (e.g. running the dashboard off-box)."""
     gpus = []
     if not os.path.isdir(sysfs_root):
@@ -277,6 +371,12 @@ def read_gpus(sysfs_root):
                     return float(f.read().strip()) * scale
             except (OSError, ValueError):
                 return None
+        def rddev(name, scale=1.0):
+            try:
+                with open(os.path.join(card, "device", name)) as f:
+                    return float(f.read().strip()) * scale
+            except (OSError, ValueError):
+                return None
         gpus.append({
             "index": idx,
             "edge_c": rd("temp1_input", 1e-3),
@@ -289,6 +389,9 @@ def read_gpus(sysfs_root):
             "power_cap_max_w": rd("power1_cap_max", 1e-6),
             "fan_rpm": rd("fan1_input"),
             "freq_ghz": rd("freq1_input", 1e-9),
+            "busy_pct": rddev("gpu_busy_percent"),
+            "vram_used_gb": rddev("mem_info_vram_used", 1.0 / (2.0 ** 30)),
+            "vram_total_gb": rddev("mem_info_vram_total", 1.0 / (2.0 ** 30)),
         })
     return gpus
 
@@ -355,7 +458,6 @@ def _cpu_busy(path="/proc/stat"):
     total = pct_of(*by[-1]) if -1 in by else None
     per = sorted((pct_of(*by[i]), i) for (i, _) in rows if i >= 0 and i in by)
     return total, [p for p, _ in per]
-    return total, per
 
 
 def read_cpu(hwmon_root="/sys/class/hwmon", cpufreq_root="/sys/devices/system/cpu"):
@@ -449,15 +551,16 @@ class History:
     so a dashboard restart or a pod swap never loses the last `history_ttl_days` of data."""
 
     COLS = ["t", "gen_tps", "gen_tps_avg", "prompt_tps", "running", "waiting", "kv",
-            "prompt_tokens", "cached_tokens", "gen_tokens", "requests",
+            "prompt_tokens", "cached_tokens", "gen_tokens", "requests", "preempt",
             "cpu_c", "cpu_ghz", "cpu_pct", "load1", "gpu_c",
             "ram_kv", "kv_store_gbps", "kv_load_gbps",
             "px_hits", "px_queries", "ext_hits", "ext_queries",
-            "kv_store_bytes", "kv_load_bytes"]
+            "kv_store_bytes", "kv_load_bytes", "reset"]
     EXTRA_COLS = [("cpu_c", "REAL"), ("cpu_ghz", "REAL"), ("cpu_pct", "REAL"), ("load1", "REAL"), ("gpu_c", "REAL"),
                   ("ram_kv", "REAL"), ("kv_store_gbps", "REAL"), ("kv_load_gbps", "REAL"),
                   ("px_hits", "REAL"), ("px_queries", "REAL"), ("ext_hits", "REAL"), ("ext_queries", "REAL"),
-                  ("kv_store_bytes", "REAL"), ("kv_load_bytes", "REAL")]
+                  ("kv_store_bytes", "REAL"), ("kv_load_bytes", "REAL"), ("preempt", "REAL"),
+                  ("reset", "INTEGER")]
 
     def __init__(self, path, ttl_seconds):
         self.path = path
@@ -470,12 +573,12 @@ class History:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS samples (t REAL PRIMARY KEY, gen_tps REAL, gen_tps_avg REAL, "
             "prompt_tps REAL, running INTEGER, waiting INTEGER, kv REAL, "
-            "prompt_tokens REAL, cached_tokens REAL, gen_tokens REAL, requests REAL, "
+            "prompt_tokens REAL, cached_tokens REAL, gen_tokens REAL, requests REAL, preempt REAL, "
             "cpu_c REAL, cpu_ghz REAL, cpu_pct REAL, load1 REAL, gpu_c REAL, "
             "ram_kv REAL, kv_store_gbps REAL, kv_load_gbps REAL, "
             "px_hits REAL, px_queries REAL, ext_hits REAL, ext_queries REAL, "
             "kv_store_bytes REAL, kv_load_bytes REAL)")
-        # databases created before the CPU panel only have the first 11 columns: ADD COLUMN keeps them
+        # databases created before newer panels only have the first columns: ADD COLUMN keeps them
         have = {r[1] for r in self.db.execute("PRAGMA table_info(samples)")}
         for name, sqlt in self.EXTRA_COLS:
             if name not in have:
@@ -484,18 +587,31 @@ class History:
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS ledger (day TEXT PRIMARY KEY, t REAL, prompt_tokens REAL, "
             "cached_tokens REAL, gen_tokens REAL, requests REAL, pod_usd REAL)")
+        # one row per poll with the raw histogram buckets (JSON per metric). Pruned with the
+        # samples TTL; window percentiles are deltas between two of these rows.
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS hist_snap (t REAL PRIMARY KEY, ttft TEXT, queue TEXT, e2e TEXT)")
         self.db.commit()
         self._last_prune = 0.0
         self.prune(now_ts())
 
-    def add(self, row, pod_usd=None):
+    def add(self, row, pod_usd=None, hists=None):
         vals = [row.get(c) for c in self.COLS]
         day = datetime.fromtimestamp(row["t"], tz=timezone.utc).strftime("%Y-%m-%d")
         with self.lock:
-            self.db.execute("INSERT OR REPLACE INTO samples VALUES (%s)" % ",".join("?" * len(self.COLS)), vals)
+            # explicit column list: old databases gain new columns via ALTER (appended at the
+            # end), so positional VALUES would silently land in the wrong slot
+            self.db.execute("INSERT OR REPLACE INTO samples (%s) VALUES (%s)"
+                            % (",".join(self.COLS), ",".join("?" * len(self.COLS))), vals)
             self.db.execute("INSERT OR REPLACE INTO ledger VALUES (?,?,?,?,?,?,?)",
                             (day, row["t"], row.get("prompt_tokens"), row.get("cached_tokens"),
                              row.get("gen_tokens"), row.get("requests"), pod_usd))
+            if hists:
+                self.db.execute("INSERT OR REPLACE INTO hist_snap VALUES (?,?,?,?)",
+                                (row["t"],
+                                 json.dumps(hists["ttft"]) if hists.get("ttft") else None,
+                                 json.dumps(hists["queue"]) if hists.get("queue") else None,
+                                 json.dumps(hists["e2e"]) if hists.get("e2e") else None))
             self.db.commit()
         if row["t"] - self._last_prune >= 60:
             self.prune(row["t"])
@@ -504,6 +620,7 @@ class History:
         """Delete everything older than the TTL (runs at most once a minute)."""
         with self.lock:
             self.db.execute("DELETE FROM samples WHERE t < ?", (now - self.ttl,))
+            self.db.execute("DELETE FROM hist_snap WHERE t < ?", (now - self.ttl,))
             self.db.commit()
         self._last_prune = now
 
@@ -514,7 +631,7 @@ class History:
 
     def rows(self, since, until=None, max_points=1500):
         """Samples in [since, until]; when there are more than max_points they are averaged into
-        equal time buckets (rates/kv averaged, running/waiting max, cumulative tokens max)."""
+        equal time buckets (rates/kv averaged, running/waiting max, cumulative counters max)."""
         until = until or now_ts()
         with self.lock:
             n = self.db.execute("SELECT COUNT(*) FROM samples WHERE t >= ? AND t <= ?", (since, until)).fetchone()[0]
@@ -525,15 +642,43 @@ class History:
                 step = max((until - since) / max_points, 1.0)
                 cur = self.db.execute(
                     "SELECT MIN(t), AVG(gen_tps), AVG(gen_tps_avg), AVG(prompt_tps), MAX(running), MAX(waiting), AVG(kv), "
-                    "MAX(prompt_tokens), MAX(cached_tokens), MAX(gen_tokens), MAX(requests), "
+                    "MAX(prompt_tokens), MAX(cached_tokens), MAX(gen_tokens), MAX(requests), MAX(preempt), "
                     "AVG(cpu_c), AVG(cpu_ghz), AVG(cpu_pct), AVG(load1), MAX(gpu_c), "
                     "AVG(ram_kv), AVG(kv_store_gbps), AVG(kv_load_gbps), "
                     "MAX(px_hits), MAX(px_queries), MAX(ext_hits), MAX(ext_queries), "
-                    "MAX(kv_store_bytes), MAX(kv_load_bytes) FROM samples "
+                    "MAX(kv_store_bytes), MAX(kv_load_bytes), MAX(reset) FROM samples "
                     "WHERE t >= ? AND t <= ? GROUP BY CAST((t - ?) / ? AS INTEGER) ORDER BY 1",
                     (since, until, since, step))
             out = [dict(zip(self.COLS, r)) for r in cur.fetchall()]
         return out
+
+    def hist_window(self, since):
+        """(t0, h0, t1, h1): the two histogram snapshots that bracket the window [since, now].
+
+        h0 is the first snapshot at/after `since` (falling back to the oldest stored one);
+        h1 is the newest. h0/h1 are {ttft|queue|e2e: {le: count}} or None."""
+        with self.lock:
+            r1 = self.db.execute("SELECT t, ttft, queue, e2e FROM hist_snap ORDER BY t DESC LIMIT 1").fetchone()
+            r0 = self.db.execute("SELECT t, ttft, queue, e2e FROM hist_snap WHERE t >= ? ORDER BY t ASC LIMIT 1",
+                                 (since,)).fetchone()
+            if r0 is None:
+                r0 = self.db.execute("SELECT t, ttft, queue, e2e FROM hist_snap ORDER BY t ASC LIMIT 1").fetchone()
+
+        def parse(r):
+            if not r or not r[0]:
+                return None
+            d = {}
+            for i, key in ((1, "ttft"), (2, "queue"), (3, "e2e")):
+                if r[i]:
+                    try:
+                        d[key] = {k: float(v) for k, v in json.loads(r[i]).items()}
+                    except (ValueError, TypeError):
+                        pass
+            return d or None
+
+        if r0 is None or r1 is None:
+            return None, None, None, None
+        return r0[0], parse(r0), r1[0], parse(r1)
 
     def ledger(self):
         cols = ["day", "t", "prompt_tokens", "cached_tokens", "gen_tokens", "requests", "pod_usd"]
@@ -567,6 +712,7 @@ class Poller(threading.Thread):
         self.snapshot = {"ok": False, "error": "starting", "updated_at": iso(now_ts())}
         self.prev = None  # (ts, totals) for rate computation
         self.prev_running = None  # llama.cpp request synthesis: last requests_processing gauge
+        self.hist_raw = {}  # raw histogram buckets of the current vLLM lifetime (since-restart fallback)
         self.gpu_history = deque(maxlen=max(180, int(900 / self.cfg.poll_interval)))  # 15 min of GPU readings regardless of poll interval
 
     def fetch(self):
@@ -591,7 +737,8 @@ class Poller(threading.Thread):
     def scope_view(cfg, ts, counters, started_ts, prior_usd=0.0, prior_hours=0.0):
         """Totals + pod cost + provider costs for one window.
 
-        counters: cumulative counter dict for the window (session deltas already applied).
+        counters: cumulative counter dict for the window (session deltas already applied);
+                  may carry "finish" (the per-reason split), echoed through to the totals.
         started_ts: when the window's pod wall-clock starts (None -> no pod cost).
         prior_usd/prior_hours: spend and hours on earlier pods folded into this window
                                (total scope only; used across GPU swaps).
@@ -638,6 +785,7 @@ class Poller(threading.Thread):
                 "accept_rate_pct": (100.0 * accepted / drafts) if drafts else None,
                 "preemptions": counters["num_preemptions_total"],
                 "mean_e2e_s": Poller.mean_e2e_s(counters),
+                "finish": counters.get("finish") or {},
             },
             "pod": {"name": cfg.pod_name, "hourly_usd": cfg.pod_hourly,
                     "started_at": iso(started_ts) if started_ts else None,
@@ -645,16 +793,84 @@ class Poller(threading.Thread):
             "costs": costs,
         }
 
-    def compute(self, ts, totals, gauges, model, is_llama=False):
+    def window_lat(self, minutes):
+        """Latency percentiles over the last `minutes` of histogram deltas.
+
+        Falls back to the current vLLM lifetime (self.hist_raw) when there is not enough
+        history to bracket the window. None per metric when the source has no histogram."""
+        t0, h0, t1, h1 = self.history.hist_window(now_ts() - minutes * 60)
+        d = None
+        if h0 is not None and h1 is not None and t1 - t0 >= 5:
+            d = {}
+            for key in ("ttft", "queue", "e2e"):
+                if key in h0 and key in h1:
+                    d[key] = {le: c - h0[key].get(le, 0.0) for le, c in h1[key].items()}
+        if d is None:
+            d = self.hist_raw or {}
+        return {
+            "ttft_p50": hist_quantile(d.get("ttft"), 0.50),
+            "ttft_p90": hist_quantile(d.get("ttft"), 0.90),
+            "queue_p90": hist_quantile(d.get("queue"), 0.90),
+            "e2e_p90": hist_quantile(d.get("e2e"), 0.90),
+        }
+
+    def ledger_days(self):
+        """Per-UTC-day view of the ledger: deltas + the hero provider's cost per day,
+        computed here (costs are never computed in JS)."""
+        hero = None
+        for p in self.cfg.providers:
+            if p.get("name") == self.cfg.hero_provider:
+                hero = p
+                break
+        if hero is None and self.cfg.providers:
+            hero = self.cfg.providers[0]
+        days = []
+        prev = None
+        for r in self.history.ledger():
+            def daydelta(key):
+                cur = r.get(key) or 0.0
+                pv = (prev.get(key) or 0.0) if prev else 0.0
+                return max(cur - pv, 0.0)
+            prompt = daydelta("prompt_tokens")
+            cached = min(daydelta("cached_tokens"), prompt)
+            gen = daydelta("gen_tokens")
+            requests = daydelta("requests")
+            pod = daydelta("pod_usd")
+            api = None
+            if hero is not None:
+                api = ((prompt - cached) * hero.get("input_per_m", 0)
+                       + cached * hero.get("cached_input_per_m", hero.get("input_per_m", 0))
+                       + gen * hero.get("output_per_m", 0)) / 1e6
+            dow = datetime.strptime(r["day"], "%Y-%m-%d").replace(tzinfo=timezone.utc).weekday()
+            days.append({"day": r["day"], "dow": (dow + 1) % 7,  # 0=Sunday, like JS getUTCDay
+                         "api_usd": api, "pod_usd": pod,
+                         "prompt_tokens": prompt, "cached_tokens": cached,
+                         "gen_tokens": gen, "requests": requests})
+            prev = r
+        return {"days": days, "hero": (hero or {}).get("name") if hero else None,
+                "pod_per_day": (self.cfg.pod_hourly * 24.0) if self.cfg.pod_hourly else None}
+
+    def compute(self, ts, totals, gauges, model, is_llama=False, reset=False):
         cfg = self.cfg
         prompt = totals["prompt_tokens_total"]
         gen = totals["generation_tokens_total"]
         drafts = totals["spec_decode_num_draft_tokens_total"]
         accepted = totals["spec_decode_num_accepted_tokens_total"]
 
-        rates = {"gen_tps": 0.0, "prompt_tps": 0.0, "itl_ms": None, "accept_rate": None}
+        rates = {"gen_tps": 0.0, "prompt_tps": 0.0, "itl_ms": None, "accept_rate": None,
+                 "req_per_min": None}
         store_gbps, load_gbps = None, None   # KV offload tier transfer, GB/min over the last poll
-        if self.prev:
+        w0 = (self.history.rows(ts - 60.0, ts) or [None])[0]
+
+        def delta60(col, cur):
+            if not w0 or w0.get(col) is None:
+                return None
+            return max(cur - w0[col], 0.0)
+
+        # the poll that absorbs a vLLM restart folds the old lifetime into the cumulative
+        # totals, so every counter delta for this window is the whole new lifetime, not this
+        # poll's seconds: report 0/None instead of a one-sample 30,000 tok/s spike
+        if self.prev and not reset:
             pts, p = self.prev
             dt = max(ts - pts, 1e-6)
             rates["gen_tps"] = max(gen - p["generation_tokens_total"], 0) / dt
@@ -677,6 +893,7 @@ class Poller(threading.Thread):
             store_gbps = max(totals["kv_offload_store_bytes_total"] - p["kv_offload_store_bytes_total"], 0.0) / dt * 60.0 / GB
             load_gbps = max(totals["kv_offload_load_bytes_total"] - p["kv_offload_load_bytes_total"], 0.0) / dt * 60.0 / GB
         self.prev = (ts, dict(totals))
+        rates["req_per_min"] = None if reset else delta60("requests", totals["request_success_total"])
 
         # smoothed throughput: trailing mean over cfg.smoothing_seconds of history (+ this poll)
         avg, n = self.history.mean_gen_tps(ts - cfg.smoothing_seconds)
@@ -688,6 +905,12 @@ class Poller(threading.Thread):
         sess = self.state.session
         if sess:
             sess_counts = {k: max(totals[k] - sess["totals"].get(k, 0.0), 0.0) for k in COUNTERS}
+            # per-reason session split: only for sessions snapshotted with it (old state.json
+            # files predate the split; then the session view simply carries no "finish")
+            if isinstance(sess.get("finish"), dict):
+                total_finish = totals.get("finish") or {}
+                sess_counts["finish"] = {r: max(total_finish.get(r, 0.0) - sess["finish"].get(r, 0.0), 0.0)
+                                         for r in set(total_finish) | set(sess["finish"])}
             session_view = self.scope_view(cfg, ts, sess_counts, sess["started_at"])
 
         # KV-cache tiers: the VRAM pool + the CPU offload tier (radiance kv_offloading).
@@ -698,12 +921,6 @@ class Poller(threading.Thread):
             raw = self.state.last_raw
             g = gauges
             GB = 2.0 ** 30
-            w0 = (self.history.rows(ts - 60.0, ts) or [None])[0]
-
-            def delta60(col, cur):
-                if not w0 or w0.get(col) is None:
-                    return None
-                return max(cur - w0[col], 0.0)
 
             px_h, px_q = raw["prefix_cache_hits_total"], raw["prefix_cache_queries_total"]
             ext_h, ext_q = raw["external_prefix_cache_hits_total"], raw["external_prefix_cache_queries_total"]
@@ -757,6 +974,8 @@ class Poller(threading.Thread):
             "since": iso(self.state.first_seen) if self.state.first_seen else None,
             "vllm_restarts_seen": self.state.resets,
             "hero_provider": cfg.hero_provider,
+            "gateway_url": cfg.gateway_url,
+            "poll_interval_s": cfg.poll_interval,
             "live": {
                 "gen_tps": rates["gen_tps"],
                 "gen_tps_avg": gen_tps_avg,
@@ -764,6 +983,7 @@ class Poller(threading.Thread):
                 "prompt_tps": rates["prompt_tps"],
                 "itl_ms": rates["itl_ms"],
                 "accept_rate": rates["accept_rate"],
+                "req_per_min": rates["req_per_min"],
                 "running": gauges["num_requests_running"],
                 "waiting": gauges["num_requests_waiting"],
                 "kv_cache_pct": None if is_llama else 100.0 * gauges["kv_cache_usage_perc"],
@@ -773,6 +993,7 @@ class Poller(threading.Thread):
             "pod": total_view["pod"],
             "costs": total_view["costs"],
             "session": session_view,
+            "lat": self.window_lat(cfg.history_minutes),
             "history_minutes": cfg.history_minutes,
             "ui_version": UI_VERSION,
             "history_db": self.history.info(),
@@ -784,10 +1005,10 @@ class Poller(threading.Thread):
             ts = now_ts()
             try:
                 text = self.fetch()
-                counters, gauges, model, is_llama = parse_metrics(text)
+                counters, gauges, model, is_llama, reasons, hists = parse_metrics(text)
                 if is_llama:
                     model = self.cfg.model_override or model
-                totals = self.state.absorb(counters)
+                totals, reset = self.state.absorb(counters, reasons)
                 if is_llama:
                     # llama.cpp has no request counter: count 0->N transitions of requests_processing
                     prev_running = 0.0 if self.prev_running is None else self.prev_running
@@ -797,7 +1018,8 @@ class Poller(threading.Thread):
                     self.prev_running = gauges["num_requests_running"]
                     totals["request_success_total"] += self.state.extra_requests
                 self.state.ensure_session(ts, totals)
-                snap = self.compute(ts, totals, gauges, model, is_llama)
+                self.hist_raw = {k: dict(v) for k, v in hists.items() if v}
+                snap = self.compute(ts, totals, gauges, model, is_llama, reset)
                 gpus = read_gpus(self.cfg.gpu_sysfs)
                 if gpus:
                     self.gpu_history.append({"t": ts, "gpus": gpus})
@@ -827,12 +1049,14 @@ class Poller(threading.Thread):
                                   "cached_tokens": totals["prompt_tokens_cached_total"],
                                   "gen_tokens": totals["generation_tokens_total"],
                                   "requests": totals["request_success_total"],
+                                  "preempt": totals["num_preemptions_total"],
+                                  "reset": 1 if reset else 0,
                                   "cpu_c": cpu.get("tctl_c"), "cpu_ghz": cpu.get("ghz_max"),
                                   "cpu_pct": cpu.get("pct"), "load1": cpu.get("load1"),
                                   "gpu_c": max([(g.get("junction_c") if g.get("junction_c") is not None else g.get("edge_c")) for g in gpus
                                    if g.get("junction_c") is not None or g.get("edge_c") is not None] or [None]),
                                   **kv_sample},
-                                 pod_usd=(snap.get("pod") or {}).get("usd"))
+                                 pod_usd=(snap.get("pod") or {}).get("usd"), hists=hists)
                 snap["history"] = self.history.rows(ts - self.cfg.history_minutes * 60, ts)
                 self.snapshot = snap
             # any exception here used to kill the poller thread silently (stale page, healthy /healthz);
@@ -853,10 +1077,12 @@ class Poller(threading.Thread):
 
     def frame(self, minutes):
         """Snapshot JSON for one client. The chart window is whatever the client asked for:
-        anything other than the live window baked into the snapshot is sliced from SQLite."""
+        anything other than the live window baked into the snapshot is sliced from SQLite,
+        along with the latency percentiles for that window."""
         if minutes != self.cfg.history_minutes:
             view = dict(self.snapshot)
             view["history"] = self.history.rows(now_ts() - minutes * 60)
+            view["lat"] = self.window_lat(minutes)
         else:
             view = self.snapshot
         return json.dumps(view)
@@ -884,7 +1110,6 @@ class Poller(threading.Thread):
 
 
 POLLER = None
-
 
 
 DOCKER_SOCK = os.environ.get("TOKENOMICS_DOCKER_SOCK", "/var/run/docker.sock")
@@ -990,6 +1215,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _gw_live(self):
+        """Proxy the LLM gateway observer so the browser stays same-origin (the gateway does
+        not send CORS headers and does not need to). Body passes through unchanged."""
+        url = POLLER.cfg.gateway_url
+        if not url:
+            return self._send(404, json.dumps({"ok": False, "error": "gateway not configured"}))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "tokenomics/1.1"})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                body = r.read()
+            return self._send(200, body, "application/json; charset=utf-8")
+        except Exception as e:
+            return self._send(502, json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}))
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         name = None
@@ -1005,7 +1244,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stats":
             return self._send(200, json.dumps(POLLER.snapshot))
         if path == "/api/ledger":
-            return self._send(200, json.dumps({"days": POLLER.history.ledger()}))
+            return self._send(200, json.dumps(POLLER.ledger_days()))
+        if path == "/api/gw_live":
+            return self._gw_live()
         if path == "/api/history":
             # ?minutes=N (capped at the TTL) -> samples from SQLite, bucket-averaged above 1500 points
             qs = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
@@ -1080,7 +1321,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.environ.get("TOKENOMICS_CONFIG", os.path.join(HERE, "config.json")))
     ap.add_argument("--host", default=os.environ.get("TOKENOMICS_HOST", "0.0.0.0"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("TOKENOMICS_PORT", "8787")))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("TOKENOMICS_PORT", 8787)))
     args = ap.parse_args()
     cfg = Config(args.config)
     POLLER = Poller(cfg)

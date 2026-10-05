@@ -351,5 +351,55 @@
     return api;
   }
 
-  global.TokCharts = { makeChart: makeChart, niceScale: niceScale, timeFmt: timeFmt, esc: esc };
+  /* ---------- raw path builders (the hand-built 1c SVGs reuse the engine's rules) ----------
+     Same contract as the chart engine: vals is an array where nulls break the line,
+     Fritsch-Carlson monotone interpolation, viewBox 0 0 W H (default 1000x100),
+     o = { w, h, lo, hi, padT, padB, base, step }. Returns { line, area }. */
+  function paths(vals, o) {
+    var W = o.w || 1000, H = o.h || 100, pt = o.padT || 0, pb = o.padB || 0, n = vals.length;
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+    var X = function (i) { return n > 1 ? i / (n - 1) * W : 0; };
+    var Y = function (v) { return pt + (H - pt - pb) * (1 - (clamp(v, o.lo, o.hi) - o.lo) / (o.hi - o.lo)); };
+    var base = Y(o.base != null ? o.base : o.lo);
+    var line = "", area = "", run = [];
+    function flush() {
+      if (!run.length) return;
+      var seg = o.step ? stepRun(run) : smoothRun(run);
+      line += seg;
+      area += seg + "L" + run[run.length - 1].x.toFixed(1) + " " + base.toFixed(1) +
+        "L" + run[0].x.toFixed(1) + " " + base.toFixed(1) + "Z";
+      run = [];
+    }
+    for (var i = 0; i < vals.length; i++) {
+      var v = vals[i];
+      if (v == null || !isFinite(v)) flush(); else run.push({ x: X(i), y: Y(v) });
+    }
+    flush();
+    return { line: line, area: area };
+  }
+
+  /* vertical bars, one per sample, as a single path (o.bw = bar width as a fraction of a
+     sample slot, default .62) */
+  function stepRun(P) {
+    var d = "M" + P[0].x.toFixed(1) + " " + P[0].y.toFixed(1);
+    for (var i = 1; i < P.length; i++) d += "H" + P[i].x.toFixed(1) + "V" + P[i].y.toFixed(1);
+    return d;
+  }
+  function barsPath(vals, o) {
+    var W = o.w || 1000, H = o.h || 100, n = vals.length;
+    var bw = (o.bw == null ? 0.62 : o.bw) * W / n;
+    var d = "";
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+    for (var i = 0; i < n; i++) {
+      var v = vals[i];
+      if (v == null || !isFinite(v) || v <= 0) continue;
+      var x = (i + 0.5) * W / n - bw / 2;
+      var y = H - H * clamp((v - o.lo) / (o.hi - o.lo), 0, 1);
+      d += "M" + x.toFixed(1) + " " + H + "V" + y.toFixed(1) + "H" + (x + bw).toFixed(1) + "V" + H + "Z";
+    }
+    return d;
+  }
+
+  global.TokCharts = { makeChart: makeChart, niceScale: niceScale, timeFmt: timeFmt, esc: esc,
+                       paths: paths, barsPath: barsPath };
 })(window);
