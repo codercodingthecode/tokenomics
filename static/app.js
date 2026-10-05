@@ -220,7 +220,7 @@
     else kv = Math.round(kvv) + "% full";
     p.appendChild(document.createTextNode("Generating "));
     p.appendChild(el("b", null, fmt1(L.gen_tps) + " tokens a second"));
-    p.appendChild(document.createTextNode(" for " + running + " requests while " +
+    p.appendChild(document.createTextNode(" for " + running + (running === 1 ? " request" : " requests") + " while " +
       (waiting === 1 ? "1 waits" : waiting + " wait") + " for a slot. Decode is " +
       pct + "% " + (d >= 0 ? "above" : "below") + " its " + avgLabel(s) +
       " and the GPU KV cache is " + kv + "."));
@@ -317,7 +317,7 @@
     }
     const dec = makeStage({ key: "d", col: "line", decode: true, label: "3 \u00b7 Decode", unit: "tok/s",
       badge, num: fmt1(L.gen_tps),
-      caption: fmtInt(L.running) + " requests generating",
+      caption: fmtInt(L.running) + (L.running === 1 ? " request generating" : " requests generating"),
       details: [
         ["between tokens", L.itl_ms == null ? "\u2013" : Math.round(L.itl_ms) + " ms"],
         ["MTP drafts kept", L.accept_rate == null ? "\u2013" : (100 * L.accept_rate).toFixed(1) + "%"],
@@ -590,7 +590,7 @@
     const sum = gen.reduce((a, r) => a + (r.tok_s || 0), 0);
     const w = pre.filter(r => r.age_s > 15).sort((a, b) => b.age_s - a.age_s)[0];
     const are = n => n === 1 ? "is" : "are";
-    p.appendChild(el("b", null, (stale ? "As of " + hhmmss(snap.time) + ", " : "") + inFlight.length + " requests in flight."));
+    p.appendChild(el("b", null, (stale ? "As of " + hhmmss(snap.time) + ", " : "") + inFlight.length + (inFlight.length === 1 ? " request in flight" : " requests in flight") + "."));
     p.appendChild(document.createTextNode(" " + gen.length + " " + are(gen.length) + " generating at " +
       sum.toFixed(1) + " tok/s combined, " + pre.length + " " + are(pre.length) +
       " waiting for a first token and " + q.length + " " + are(q.length) + " queued at the gateway." +
@@ -1107,9 +1107,13 @@
     col.appendChild(head);
     if (!days.length) { col.appendChild(el("p", "ledger-cap", "No full days recorded yet.")); return; }
     const maxApi = Math.max.apply(null, days.map(d => d.api_usd || 0).concat([0]));
-    const hi = Math.max(300, Math.ceil(maxApi / 100) * 100);
+    /* $100 gridlines at design scale; step up in nice sizes once days cost more */
+    let step = 100;
+    for (const s of [100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 50000, 100000])
+      if (Math.ceil(Math.max(maxApi, 300) / s) <= 6) { step = s; break; }
+    const hi = Math.max(300, Math.ceil(Math.max(maxApi, 300) / step) * step);
     const chart = el("div", "ledger-chart");
-    for (let v = 100; v <= hi; v += 100) {
+    for (let v = step; v <= hi; v += step) {
       const g = el("div", "grid");
       g.style.top = (100 - 100 * v / hi).toFixed(2) + "%";
       chart.appendChild(g);
@@ -1163,7 +1167,7 @@
   function renderFooter(s) {
     const db = s.history_db || {};
     $("footer").textContent = "Read from vLLM /metrics and host hwmon every " +
-      (s.poll_interval_s != null ? s.poll_interval_s : "5") + " seconds. Totals survive vLLM restarts and are never pruned; " +
+      (s.poll_interval_s != null ? s.poll_interval_s : 5) + (Number(s.poll_interval_s || 5) === 1 ? " second" : " seconds") + ". Totals survive vLLM restarts and are never pruned; " +
       "chart samples are kept for " + (db.ttl_days != null ? db.ttl_days : "7") + " days" +
       (db.rows != null ? " (" + db.rows.toLocaleString("en-US") + " rows" +
         (db.bytes ? ", " + (db.bytes / 1048576).toFixed(1) + " MB" : "") + ")" : "") + ".";
