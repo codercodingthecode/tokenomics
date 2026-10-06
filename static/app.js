@@ -388,14 +388,16 @@
         start = -1;
       }
     }
-    /* RAM-restore bursts: load rate above ~1.5 GB/min */
+    /* RAM-restore bursts: load rate above ~1.5 GB/min. One hot poll counts - at
+       1-s polling a restore is a 1-2 s load, and bucketed windows can merge two
+       hot polls into one row, so a min-length-2 run would drop real restores. */
     start = -1;
     for (let i = 0; i <= H.length; i++) {
       const hot = i < H.length && H[i].kv_load_gbps != null && H[i].kv_load_gbps > 1.5;
       if (hot && start < 0) start = i;
       if ((!hot || i === H.length) && start >= 0) {
         const end = hot ? i : i - 1;
-        if (end > start) {
+        if (end >= start) {
           let gb = 0;
           for (let j = start; j <= end; j++) {
             const dt = j > 0 ? H[j].t - H[j - 1].t : 5;
