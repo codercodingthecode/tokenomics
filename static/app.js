@@ -348,7 +348,8 @@
       caption: (T.mean_e2e_s == null ? "\u2013" : T.mean_e2e_s.toFixed(1)) + " s end-to-end on average",
       details: [
         ["end-to-end p90", secStr(lat.e2e_p90)],
-        ["how they ended", null],
+        ["how they ended" + (s.finish_since ? " \u00b7 since " + shortDate(s.finish_since) : ""),
+         fTotal > 0 ? fmtInt(fTotal) : null],
       ],
       extra });
 

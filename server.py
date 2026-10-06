@@ -225,6 +225,7 @@ class State:
         # same baseline + last_raw accounting as the main counters, so it is restart-safe
         self.reason_baseline = {}
         self.reason_last_raw = {}
+        self.reason_started_at = None  # first poll where the source labeled finished_reason
         self.session = None  # {"started_at": ts, "totals": {counter: value}, "finish": {reason: value}}
         self.load()
 
@@ -240,6 +241,7 @@ class State:
             self.extra_requests = float(d.get("extra_requests", 0.0))
             self.reason_baseline = {k: float(v) for k, v in (d.get("reason_baseline") or {}).items()}
             self.reason_last_raw = {k: float(v) for k, v in (d.get("reason_last_raw") or {}).items()}
+            self.reason_started_at = d.get("reason_started_at")
             s = d.get("session")
             if isinstance(s, dict) and s.get("started_at") and isinstance(s.get("totals"), dict):
                 self.session = s
@@ -254,6 +256,7 @@ class State:
                        "last_reset_at": self.last_reset_at,
                        "extra_requests": self.extra_requests,
                        "reason_baseline": self.reason_baseline, "reason_last_raw": self.reason_last_raw,
+                       "reason_started_at": self.reason_started_at,
                        "session": self.session}, f, indent=1)
         os.replace(tmp, self.path)
 
@@ -280,6 +283,8 @@ class State:
         if reasons is not None:
             for r, v in reasons.items():
                 self.reason_last_raw[r] = float(v)
+            if self.reason_started_at is None and self.reason_last_raw:
+                self.reason_started_at = now_ts()
         if self.first_seen is None:
             self.first_seen = now_ts()
         self.save()
@@ -973,6 +978,7 @@ class Poller(threading.Thread):
             "source": {"label": cfg.label, "metrics_url": cfg.metrics_url, "model": model},
             "since": iso(self.state.first_seen) if self.state.first_seen else None,
             "vllm_restarts_seen": self.state.resets,
+            "finish_since": iso(self.state.reason_started_at) if self.state.reason_started_at else None,
             "hero_provider": cfg.hero_provider,
             "gateway_url": cfg.gateway_url,
             "poll_interval_s": cfg.poll_interval,

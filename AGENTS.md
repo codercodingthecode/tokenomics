@@ -132,7 +132,11 @@ downstream.
 ## State and restarts
 
 - `state.json`: `baseline`, `last_raw`, `resets`, `last_reset_at`, `session
-  {started_at, totals, finish}`, `reason_baseline`, `reason_last_raw`.
+  {started_at, totals, finish}`, `reason_baseline`, `reason_last_raw`,
+  `reason_started_at` (first poll that carried the per-reason split, stamped the
+  first time reasons are seen; surfaced as `finish_since` so the "how they
+  ended" row can label its window - it only covers traffic since that stamp,
+  not the full lifetime).
   Written atomically (`.tmp` + rename) after every poll. Delete it to count from zero.
   `last_reset_at` stamps the poll that saw the most recent counter drop; the KV panels
   label their since-restart numbers with it.
