@@ -433,7 +433,7 @@
         l.style.left = (100 * (e.x - t0) / span).toFixed(2) + "%";
         plot.appendChild(l);
       } else {
-        const b = el("div", "mc-band " + e.kind);
+        const b = el("div", "mc-band " + (e.kind === "restore" ? "good" : e.kind));
         b.style.left = (100 * (e.a - t0) / span).toFixed(2) + "%";
         b.style.width = (100 * Math.max(e.b - e.a, 1) / span).toFixed(2) + "%";
         if (e.kind === "idle") b.appendChild(el("span", "lbl", "idle " + e.dur + " s"));
@@ -469,16 +469,25 @@
     const x3 = el("span", null, hhmm(t1)); x3.style.right = "0";
     xrow.append(x0, x1, x2, x3);
 
-    /* notes: one per notable event, at most 3, skip collisions */
-    const placed = [];
+    /* notes: one per notable event, at most 3, skip collisions. The biggest event
+       (preemptions counted, GB restored) claims its slot first, so a +35 burst sitting
+       next to a +2 still shows instead of being swallowed by its smaller neighbour. */
+    const cands = [];
     for (const e of evs) {
       if (e.kind !== "preempt" && e.kind !== "restore") continue;
+      cands.push({ e, x: 100 * ((e.kind === "preempt" ? e.x : e.a) - t0) / span,
+        score: e.kind === "preempt" ? e.k : e.gb });
+    }
+    cands.sort((a, b) => b.score - a.score ||
+      ((a.e.x != null ? a.e.x : a.e.a) - (b.e.x != null ? b.e.x : b.e.a)));
+    const placed = [];
+    for (const c of cands) {
       if (placed.length >= 3) break;
-      const x = 100 * ((e.kind === "preempt" ? e.x : e.a) - t0) / span;
-      if (placed.some(pp => Math.abs(pp - x) < 18)) continue;
-      placed.push(x);
+      if (placed.some(pp => Math.abs(pp - c.x) < 18)) continue;
+      placed.push(c.x);
+      const e = c.e;
       const n = el("div", "mc-note " + (e.kind === "preempt" ? "bad" : "good"));
-      n.style.left = x.toFixed(2) + "%";
+      n.style.left = c.x.toFixed(2) + "%";
       n.appendChild(el("div", "t", hhmm(e.kind === "preempt" ? e.x : e.a)));
       n.appendChild(el("div", "txt", e.kind === "preempt"
         ? "A " + e.n + "K-token prompt filled the cache to " + (e.kv == null ? "\u2013" : e.kv) + "%. " +
