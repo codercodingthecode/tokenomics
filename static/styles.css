@@ -243,6 +243,8 @@ section { border-bottom: 1px solid var(--border); }
 .sec-meta { font-size: 13.5px; color: var(--text-3); white-space: nowrap; }
 .sec-sentence { margin: 10px 0 0; max-width: 78ch; font-size: 18px; line-height: 1.5; color: var(--text-2); text-wrap: pretty; }
 .sec-sentence b { color: var(--text); font-weight: 600; }
+/* the summary flips between the idle sentence and the long generating one; reserve the 2-line height (2 x 18px x 1.5) so sections below never shift */
+#summary { min-height: 54px; }
 
 /* ---------- section 1: pipeline + throughput ---------- */
 .s1 { container-type: inline-size; padding: 40px 0 38px; }
