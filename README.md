@@ -8,7 +8,7 @@ glance:
 1. **What is the server doing right now?** a four-stage pipeline - Queue → Prefill →
    Decode → Done - with waiting requests, prompt tok/s, generation tok/s against its
    rolling average, requests per minute, queue/TTFT/e2e percentiles, and one large
-   throughput chart with written notes for preemption and RAM-restore bursts.
+   throughput chart, drawn as 5-second averages so the line shows load levels, with written notes for preemption and RAM-restore bursts - hover it to read any point in time.
 2. **What is each request doing?** (needs the LLM gateway, [below](#live-requests-optional))
    one row per in-flight request from the gateway's observer endpoint - phase,
    time-to-first-token, token counts, a live tok/s sparkline, and an expandable tail of

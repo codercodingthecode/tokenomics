@@ -34,7 +34,7 @@ about how the code is put together, the constraints that are non-negotiable, and
 | `server.py` | config, restart-safe state, poller thread, costs, latency percentiles, gateway proxy, hwmon readers, HTTP handler, SSE |
 | `static/index.html` | markup |
 | `static/styles.css` | all styling; theming through CSS custom properties |
-| `static/charts.js` | `window.TokCharts` - the dependency-free SVG chart engine (line/area, monotone interpolation, gaps, bands, refs, end pills, crosshair) plus `paths()`/`barsPath()` raw path builders the hand-built section SVGs reuse |
+| `static/charts.js` | `window.TokCharts` - the dependency-free SVG chart engine (line/area, monotone interpolation, gaps, bands, refs, end pills, crosshair) plus `paths()`/`timePaths()`/`barsPath()` raw path builders the hand-built section SVGs reuse |
 | `static/app.js` | SSE client, render loop, gateway observer panel (1 s poll), scope toggle, range control, theme toggle |
 | `static/fonts/` | vendored variable woff2: Instrument Sans (text) + Azeret Mono (numbers), latin + latin-ext |
 | `config.example.json` | documented template; copy to `config.json` |
@@ -217,7 +217,16 @@ quietly. Keep it this way: no vendor CLIs, no `rocm-smi`/`nvidia-smi` shelling o
   gap rules, `vector-effect: non-scaling-stroke`). `null` is a break in the line, never
   a straight join. Colors are emitted as `var(--token)` — pass a CSS variable name,
   never a raw color, and add new files to `STATIC_FILES` in `server.py` or they will
-  not be served.
+  not be served. The main chart alone has a hover tip (crosshair + one dot per series +
+  time header with generation, window avg, running, waiting, KV %): the plot is rebuilt
+  every frame, so the hover elements are re-created per draw and re-positioned from the
+  last pointer x; nulls drop their row. Its lines (and the tip) are drawn from the
+  per-second samples averaged into 5-second buckets fixed to the epoch grid - display
+  smoothing only, so the 15-min view shows load levels instead of single-sample spikes
+  while the window slides; the live end pill, event notes and every other view keep the
+  raw samples. Its x is time, not index (`TokCharts.timePaths`): the axis labels and
+  event notes are placed by time, so a run of missed polls breaks the line instead of
+  compressing time and drifting the line off its own axis.
 - Ranges come from SQLite: 15 min/1 h ride the snapshot buffer, 6 h/24 h/7 d refetch.
 - Themes: `dark` is the default, then `light`, then `amber`; the header button cycles
   and persists to `localStorage`, and `?theme=` wins. Only chrome changes between

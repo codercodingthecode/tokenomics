@@ -199,7 +199,7 @@
     $("avgLegend").textContent = avgLabel(s);
     renderSummary(s, L);
     renderPipeline(s, L, H);
-    drawMainChart(H);
+    drawMainChart(H, s);
   }
 
   function renderSummary(s, L) {
@@ -413,16 +413,128 @@
     return evs;
   }
 
-  function drawMainChart(H) {
+  /* ---------- main chart display smoothing ----------
+     Purely for drawing: average the per-second samples into 5-second buckets so the
+     15-min line shows load levels instead of single-sample spikes. Buckets ride a
+     fixed epoch-5s grid, not the window start - the window slides 1 s per poll, and
+     grid-relative buckets would re-shuffle every point every second. On the fixed
+     grid a bucket's contents never change; only the newest one grows, so the line
+     extends at the right edge and everything else holds still. Nulls stay nulls (a
+     bucket with no data is a gap). The hover tip reads these same buckets, the live
+     end pill and the event notes keep using the raw samples, and nothing
+     server-side or sampling-side is touched. */
+  function bucketRows(H, sec) {
+    if (H.length < 3) return H;
+    const out = [];
+    let cur = null;
+    const push = () => {
+      if (!cur) return;
+      out.push({ t: cur.t,
+        gen_tps: cur.ng ? cur.g / cur.ng : null,
+        gen_tps_avg: cur.na ? cur.a / cur.na : null,
+        running: cur.nr ? cur.ru / cur.nr : null,
+        waiting: cur.nw ? cur.wa / cur.nw : null,
+        kv: cur.nk ? cur.kvs / cur.nk : null });
+      cur = null;
+    };
+    for (const r of H) {
+      const b = Math.floor(r.t / sec) * sec;
+      if (!cur || cur.b !== b) {
+        push();
+        cur = { b, t: r.t, g: 0, ng: 0, a: 0, na: 0, ru: 0, nr: 0, wa: 0, nw: 0, kvs: 0, nk: 0 };
+      }
+      cur.t = r.t;
+      if (r.gen_tps != null) { cur.g += r.gen_tps; cur.ng++; }
+      if (r.gen_tps_avg != null) { cur.a += r.gen_tps_avg; cur.na++; }
+      if (r.running != null) { cur.ru += r.running; cur.nr++; }
+      if (r.waiting != null) { cur.wa += r.waiting; cur.nw++; }
+      if (r.kv != null) { cur.kvs += r.kv; cur.nk++; }
+    }
+    push();
+    return out;
+  }
+
+  /* ---------- main chart hover: crosshair, one dot per series, time-stamped tip ----------
+     The plot is rebuilt every frame, so the hover elements are re-created on each draw
+     and re-positioned from mc.frac (last pointer x, 0..1 of the plot). Values with no
+     data at that sample drop their row, so the tip never reads "\u2013". */
+  const mc = { rows: null, t0: 0, span: 1, hi: 1, avgLabel: "", frac: null, bound: false,
+               xh: null, dotG: null, dotA: null, tip: null };
+  function mcHide() {
+    mc.frac = null;
+    if (mc.xh) mc.xh.style.display = "none";
+    if (mc.dotG) mc.dotG.style.display = "none";
+    if (mc.dotA) mc.dotA.style.display = "none";
+    if (mc.tip) mc.tip.style.display = "none";
+  }
+  function mcApply() {
+    const { rows, t0, span, hi } = mc;
+    const plot = $("mcPlot");
+    if (!rows || rows.length < 2 || mc.frac == null || !mc.xh || !plot) { mcHide(); return; }
+    const t = t0 + mc.frac * span;
+    /* nearest sample: binary search, then compare the two candidates */
+    let lo = 0, hiI = rows.length - 1;
+    while (hiI - lo > 1) { const m = (lo + hiI) >> 1; if (rows[m].t < t) lo = m; else hiI = m; }
+    const row = rows[(rows[hiI].t - t) < (t - rows[lo].t) ? hiI : lo];
+    const x = 100 * (row.t - t0) / span;
+    const xpct = x.toFixed(2) + "%";
+    mc.xh.style.display = "block";
+    mc.xh.style.left = xpct;
+    const setDot = (dot, v) => {
+      if (v == null || !isFinite(v) || v < 0 || v > hi) { dot.style.display = "none"; return; }
+      dot.style.display = "block";
+      dot.style.left = xpct;
+      dot.style.top = (100 * (1 - v / hi)).toFixed(2) + "%";
+    };
+    setDot(mc.dotG, row.gen_tps);
+    setDot(mc.dotA, row.gen_tps_avg);
+    /* tip: time header + rows */
+    while (mc.tip.firstChild) mc.tip.removeChild(mc.tip.firstChild);
+    const d = new Date(row.t * 1000);
+    mc.tip.appendChild(el("div", "t", rangeMin >= 360
+      ? d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+      : hhmmss(row.t)));
+    const addRow = (label, v, cls) => {
+      if (v == null) return;
+      const r = el("div", "r");
+      r.appendChild(el("span", null, label));
+      r.appendChild(el("b", cls, v));
+      mc.tip.appendChild(r);
+    };
+    addRow("generation", row.gen_tps == null ? null : fmt1(row.gen_tps) + " tok/s", "v-big");
+    addRow(mc.avgLabel, row.gen_tps_avg == null ? null : fmt1(row.gen_tps_avg) + " tok/s");
+    addRow("running", row.running == null ? null : fmtInt(row.running));
+    addRow("waiting", row.waiting == null ? null : fmtInt(row.waiting));
+    addRow("kv cache", row.kv == null ? null : Math.round(row.kv) + "%");
+    mc.tip.style.display = "block";
+    /* follow the crosshair; flip to the left near the right edge */
+    const pr = plot.getBoundingClientRect();
+    const px = pr.width * x / 100;
+    const flip = px + 14 + mc.tip.offsetWidth > pr.width;
+    mc.tip.style.left = Math.max(0, flip ? px - mc.tip.offsetWidth - 14 : px + 14) + "px";
+  }
+
+  function drawMainChart(H, s) {
     const plot = clear($("mcPlot"));
     const notes = clear($("mcNotes"));
     const xrow = clear($("mcX"));
-    if (H.length < 2) return;
+    if (H.length < 2) { mc.rows = null; mc.xh = mc.dotG = mc.dotA = mc.tip = null; return; }
     const t0 = H[0].t, t1 = H[H.length - 1].t, span = Math.max(t1 - t0, 1);
-    const genVals = H.map(r => r.gen_tps), avgVals = H.map(r => r.gen_tps_avg);
+    const rawGen = H.map(r => r.gen_tps);
+    const H5 = bucketRows(H, 5);  /* display smoothing only - the lines, the scale and the tip all read H5 */
+    const genVals = H5.map(r => r.gen_tps), avgVals = H5.map(r => r.gen_tps_avg);
+    /* the scale rides the drawn (bucketed) series only: the raw live value can be a
+       single-sample spike, and letting it set the axis would make the y scale jump
+       every second. If the live value outgrows the scale, the end dot clamps to the
+       top edge instead (see below). */
     const hi = TC.niceScale(0, Math.max(1, ...genVals, ...avgVals), 5).hi;
-    const gen = TC.paths(genVals, { lo: 0, hi });
-    const avg = TC.paths(avgVals, { lo: 0, hi });
+    mc.rows = H5; mc.t0 = t0; mc.span = span; mc.hi = hi;
+    mc.avgLabel = avgLabel(s);
+    /* time-based x (see TC.timePaths): the axis labels and event notes are placed by
+       time, so the line must be too, and a run of missed polls breaks the line */
+    const t5 = H5.map(r => r.t);
+    const gen = TC.timePaths(genVals, t5, { lo: 0, hi, t0, span });
+    const avg = TC.timePaths(avgVals, t5, { lo: 0, hi, t0, span });
 
     const g0 = el("div", "mc-grid"); g0.style.top = "0";
     const g1 = el("div", "mc-grid"); g1.style.top = "50%";
@@ -451,13 +563,31 @@
     svg.appendChild(svgEl("path", { d: gen.line, fill: "none", style: "stroke:var(--line)", "stroke-width": 2, "vector-effect": "non-scaling-stroke", "stroke-linejoin": "round" }));
     plot.appendChild(svg);
 
+    mc.xh = el("div", "mc-xh");
+    mc.dotG = el("span", "mc-hdot g");
+    mc.dotA = el("span", "mc-hdot a");
+    mc.tip = el("div", "mc-tip");
+    plot.append(mc.xh, mc.dotG, mc.dotA, mc.tip);
+    if (!mc.bound) {
+      mc.bound = true;
+      const host = document.querySelector(".main-chart");
+      host.addEventListener("pointermove", e => {
+        const pr = $("mcPlot").getBoundingClientRect();
+        if (!pr.width) return;
+        mc.frac = Math.min(1, Math.max(0, (e.clientX - pr.left) / pr.width));
+        mcApply();
+      });
+      host.addEventListener("pointerleave", mcHide);
+    }
+    if (mc.frac != null) mcApply();
+
     const y1 = el("span", "mc-ylab", Math.round(hi) + " tok/s"); y1.style.top = "4px";
     const y2 = el("span", "mc-ylab", String(Math.round(hi / 2))); y2.style.top = "calc(50% + 4px)";
     plot.appendChild(y1); plot.appendChild(y2);
 
-    const lastV = lastNonNull(genVals);
+    const lastV = lastNonNull(rawGen);
     if (lastV != null) {
-      const yp = (1 - lastV / hi) * 100;
+      const yp = Math.max(0, (1 - lastV / hi) * 100);
       const dot = el("span", "mc-dot");
       dot.style.left = "100%"; dot.style.top = yp.toFixed(1) + "%";
       const lab = el("span", "mc-end", fmt1(lastV));

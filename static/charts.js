@@ -378,6 +378,46 @@
     return { line: line, area: area };
   }
 
+  /* Like paths(), but x is time, not index: pts[i] is (ts[i], vals[i]) mapped to
+     [o.t0, o.t0 + o.span] x [o.lo, o.hi]. The hand-built main chart needs this because
+     its x labels and event notes are placed by time - with index-based placement a
+     run of missed polls would compress time and the line would drift off its own
+     axis. Runs also break (gaps are gaps) when the time gap to the next point exceeds
+     maxGapFrac (default 2) times the median sample spacing, so an outage shows as a
+     break instead of a stretched segment. Same null rules, same smoothRun, same
+     { line, area } result. */
+  function timePaths(vals, ts, o) {
+    var W = o.w || 1000, H = o.h || 100, pt = o.padT || 0, pb = o.padB || 0, n = vals.length;
+    var t0 = o.t0 || 0, span = Math.max(o.span || 1, 1e-6);
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+    var X = function (i) { return (ts[i] - t0) / span * W; };
+    var Y = function (v) { return pt + (H - pt - pb) * (1 - (clamp(v, o.lo, o.hi) - o.lo) / (o.hi - o.lo)); };
+    var base = Y(o.base != null ? o.base : o.lo);
+    var gaps = [];
+    for (var i = 0; i < n - 1; i++) { var g = ts[i + 1] - ts[i]; if (g > 0) gaps.push(g); }
+    gaps.sort(function (a, b) { return a - b; });
+    var med = gaps.length ? gaps[(gaps.length - 1) >> 1] : 1;
+    var maxGap = (o.maxGapFrac == null ? 2 : o.maxGapFrac) * med;
+    var line = "", area = "", run = [], prev = null;
+    function flush() {
+      if (!run.length) return;
+      var seg = o.step ? stepRun(run) : smoothRun(run);
+      line += seg;
+      area += seg + "L" + run[run.length - 1].x.toFixed(1) + " " + base.toFixed(1) +
+        "L" + run[0].x.toFixed(1) + " " + base.toFixed(1) + "Z";
+      run = [];
+    }
+    for (var i = 0; i < n; i++) {
+      var v = vals[i], ok = v != null && isFinite(v);
+      var gap = prev == null ? 0 : ts[i] - prev;
+      if (!ok || gap > maxGap) { flush(); prev = ok ? ts[i] : null; if (!ok) continue; }
+      run.push({ x: X(i), y: Y(v) });
+      prev = ts[i];
+    }
+    flush();
+    return { line: line, area: area };
+  }
+
   /* vertical bars, one per sample, as a single path (o.bw = bar width as a fraction of a
      sample slot, default .62) */
   function stepRun(P) {
@@ -401,5 +441,5 @@
   }
 
   global.TokCharts = { makeChart: makeChart, niceScale: niceScale, timeFmt: timeFmt, esc: esc,
-                       paths: paths, barsPath: barsPath };
+                       paths: paths, timePaths: timePaths, barsPath: barsPath };
 })(window);
