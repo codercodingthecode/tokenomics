@@ -4,6 +4,17 @@ Read this before changing anything. [README.md](README.md) is user-facing; this 
 about how the code is put together, the constraints that are non-negotiable, and what
 "done" means here. Update it when you change behaviour.
 
+## Working in a larger workspace
+
+This repo is normally checked out inside a larger personal workspace. At the start
+of every session, if the parent directory contains its own `AGENTS.md`, read it first:
+it carries workspace-wide rules and points to this project's page in the owner's
+knowledge vault (deploy history, gotchas, decisions, preferences). Read that project
+page too, and file durable learnings from the session back into the vault when the
+work is done. Keep this rule generic: the repo itself never contains personal paths,
+hostnames or IPs (constraint 4) - the workspace and vault pointers live in the parent
+file, not here.
+
 ## Non-negotiable constraints
 
 1. **Standard library only.** `server.py` imports nothing outside the Python 3.9 stdlib.
