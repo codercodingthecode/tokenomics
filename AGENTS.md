@@ -231,11 +231,7 @@ quietly. Keep it this way: no vendor CLIs, no `rocm-smi`/`nvidia-smi` shelling o
   not be served. The main chart alone has a hover tip (crosshair + one dot per series +
   time header with generation, window avg, running, waiting, KV %): the plot is rebuilt
   every frame, so the hover elements are re-created per draw and re-positioned from the
-  last pointer x; nulls drop their row. Its lines (and the tip) are drawn from the
-  per-second samples averaged into 5-second buckets fixed to the epoch grid - display
-  smoothing only, so the 15-min view shows load levels instead of single-sample spikes
-  while the window slides; the live end pill, event notes and every other view keep the
-  raw samples. Its x is time, not index (`TokCharts.timePaths`): the axis labels and
+  last pointer x; nulls drop their row. Its x is time, not index (`TokCharts.timePaths`): the axis labels and
   event notes are placed by time, so a run of missed polls breaks the line instead of
   compressing time and drifting the line off its own axis.
 - Ranges come from SQLite: 15 min/1 h ride the snapshot buffer, 6 h/24 h/7 d refetch.

@@ -413,47 +413,6 @@
     return evs;
   }
 
-  /* ---------- main chart display smoothing ----------
-     Purely for drawing: average the per-second samples into 5-second buckets so the
-     15-min line shows load levels instead of single-sample spikes. Buckets ride a
-     fixed epoch-5s grid, not the window start - the window slides 1 s per poll, and
-     grid-relative buckets would re-shuffle every point every second. On the fixed
-     grid a bucket's contents never change; only the newest one grows, so the line
-     extends at the right edge and everything else holds still. Nulls stay nulls (a
-     bucket with no data is a gap). The hover tip reads these same buckets, the live
-     end pill and the event notes keep using the raw samples, and nothing
-     server-side or sampling-side is touched. */
-  function bucketRows(H, sec) {
-    if (H.length < 3) return H;
-    const out = [];
-    let cur = null;
-    const push = () => {
-      if (!cur) return;
-      out.push({ t: cur.t,
-        gen_tps: cur.ng ? cur.g / cur.ng : null,
-        gen_tps_avg: cur.na ? cur.a / cur.na : null,
-        running: cur.nr ? cur.ru / cur.nr : null,
-        waiting: cur.nw ? cur.wa / cur.nw : null,
-        kv: cur.nk ? cur.kvs / cur.nk : null });
-      cur = null;
-    };
-    for (const r of H) {
-      const b = Math.floor(r.t / sec) * sec;
-      if (!cur || cur.b !== b) {
-        push();
-        cur = { b, t: r.t, g: 0, ng: 0, a: 0, na: 0, ru: 0, nr: 0, wa: 0, nw: 0, kvs: 0, nk: 0 };
-      }
-      cur.t = r.t;
-      if (r.gen_tps != null) { cur.g += r.gen_tps; cur.ng++; }
-      if (r.gen_tps_avg != null) { cur.a += r.gen_tps_avg; cur.na++; }
-      if (r.running != null) { cur.ru += r.running; cur.nr++; }
-      if (r.waiting != null) { cur.wa += r.waiting; cur.nw++; }
-      if (r.kv != null) { cur.kvs += r.kv; cur.nk++; }
-    }
-    push();
-    return out;
-  }
-
   /* ---------- main chart hover: crosshair, one dot per series, time-stamped tip ----------
      The plot is rebuilt every frame, so the hover elements are re-created on each draw
      and re-positioned from mc.frac (last pointer x, 0..1 of the plot). Values with no
@@ -520,19 +479,13 @@
     const xrow = clear($("mcX"));
     if (H.length < 2) { mc.rows = null; mc.xh = mc.dotG = mc.dotA = mc.tip = null; return; }
     const t0 = H[0].t, t1 = H[H.length - 1].t, span = Math.max(t1 - t0, 1);
-    const rawGen = H.map(r => r.gen_tps);
-    const H5 = bucketRows(H, 5);  /* display smoothing only - the lines, the scale and the tip all read H5 */
-    const genVals = H5.map(r => r.gen_tps), avgVals = H5.map(r => r.gen_tps_avg);
-    /* the scale rides the drawn (bucketed) series only: the raw live value can be a
-       single-sample spike, and letting it set the axis would make the y scale jump
-       every second. If the live value outgrows the scale, the end dot clamps to the
-       top edge instead (see below). */
+    const genVals = H.map(r => r.gen_tps), avgVals = H.map(r => r.gen_tps_avg);
     const hi = TC.niceScale(0, Math.max(1, ...genVals, ...avgVals), 5).hi;
-    mc.rows = H5; mc.t0 = t0; mc.span = span; mc.hi = hi;
+    mc.rows = H; mc.t0 = t0; mc.span = span; mc.hi = hi;
     mc.avgLabel = avgLabel(s);
     /* time-based x (see TC.timePaths): the axis labels and event notes are placed by
        time, so the line must be too, and a run of missed polls breaks the line */
-    const t5 = H5.map(r => r.t);
+    const t5 = H.map(r => r.t);
     const gen = TC.timePaths(genVals, t5, { lo: 0, hi, t0, span });
     const avg = TC.timePaths(avgVals, t5, { lo: 0, hi, t0, span });
 
@@ -585,9 +538,9 @@
     const y2 = el("span", "mc-ylab", String(Math.round(hi / 2))); y2.style.top = "calc(50% + 4px)";
     plot.appendChild(y1); plot.appendChild(y2);
 
-    const lastV = lastNonNull(rawGen);
+    const lastV = lastNonNull(genVals);
     if (lastV != null) {
-      const yp = Math.max(0, (1 - lastV / hi) * 100);
+      const yp = (1 - lastV / hi) * 100;
       const dot = el("span", "mc-dot");
       dot.style.left = "100%"; dot.style.top = yp.toFixed(1) + "%";
       const lab = el("span", "mc-end", fmt1(lastV));
